@@ -10,7 +10,7 @@ This script shows:
 import matplotlib.pyplot as plt
 import numpy as np
 
-OVERTAKING_SPEEDS_KMH = [40.0, 60.0, 80.0]
+OVERTAKING_SPEEDS_KMH = [35.0, 50.0, 65.0]
 EXPERIMENT_DURATION_S = 200.0
 
 # Keep these constants aligned with LeadVehicleController in car_following_experiment.py
@@ -18,8 +18,8 @@ MAX_SPEED_MS = 28.0
 SMOOTH_FREQ_HZ = 1.0 / 70.0
 AGGRESSIVE_FREQ_HZ = 1.0 / 28.0
 OVERTAKING_RAMP_TIME_S = 16.0
-FOLLOWING_BASE_SPEED_MS = 75.0 / 3.6
-FOLLOWING_AMPLITUDE_MS = 20.0 / 3.6
+FOLLOWING_BASE_SPEED_MS = 65.0 / 3.6  # 跟驰中心速度 (km/h → m/s)，与 car_following_experiment 一致
+FOLLOWING_AMPLITUDE_MS = 15.0 / 3.6  # 跟驰幅值 (km/h)
 FOLLOWING_STARTUP_RAMP_S = 18.0
 
 
@@ -114,7 +114,7 @@ def plot_speed_profile():
     for ax in axes[1, :]:
         ax.set_xlabel("Time (s)")
 
-    axes[0, 0].set_ylim(30, 100)
+    axes[0, 0].set_ylim(0, 95)
     fig.suptitle("Six-Experiment Speed Plan: 3 Following Styles + 3 Overtaking Speeds", fontsize=14)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig("speed_profile_6_experiments.png", dpi=150, bbox_inches="tight")
@@ -122,9 +122,9 @@ def plot_speed_profile():
     plt.show()
 
     print("\n=== Experiment Definitions ===")
-    print("Exp 1: Following smooth sinusoid around 75 +/- 20 km/h")
-    print("Exp 2: Following aggressive sinusoid around 75 +/- 20 km/h")
-    print("Exp 3: Following variable-frequency sinusoid around 75 +/- 20 km/h")
+    print("Exp 1: Following smooth sinusoid around 65 +/- 15 km/h")
+    print("Exp 2: Following aggressive sinusoid around 65 +/- 15 km/h")
+    print("Exp 3: Following variable-frequency sinusoid around 65 +/- 15 km/h")
     for i, speed_kmh in enumerate(OVERTAKING_SPEEDS_KMH, start=4):
         print(f"Exp {i}: Overtaking, lead starts from 0 then reaches {speed_kmh:.0f} km/h")
 

@@ -132,7 +132,7 @@ FOLLOWING_EXPERIMENT_TYPES = (
     'following_aggressive',
     'following_irregular',
 )
-OVERTAKING_SPEEDS_KMH = (40.0, 60.0, 80.0)
+OVERTAKING_SPEEDS_KMH = (35.0, 50.0, 65.0)
 EXPERIMENT_START_X = 120.0
 EXPERIMENT_START_Y = -1.75
 
@@ -194,8 +194,8 @@ class LeadVehicleController:
     IRREGULAR_F0_HZ = 1.0 / 90.0
     IRREGULAR_K_HZ_PER_S = 1.0 / 2400.0
     OVERTAKING_RAMP_TIME_S = 16.0
-    FOLLOWING_BASE_SPEED_MS = 75.0 / 3.6
-    FOLLOWING_AMPLITUDE_MS = 20.0 / 3.6
+    FOLLOWING_BASE_SPEED_MS = 65.0 / 3.6   # 跟驰曲线中心速度 (km/h 换算为 m/s)
+    FOLLOWING_AMPLITUDE_MS = 15.0 / 3.6    # 跟驰速度正弦幅值 (km/h)
     FOLLOWING_STARTUP_RAMP_S = 18.0
     
     def __init__(self, lead_vehicle, base_speed=DEFAULT_LEAD_SPEED,
@@ -767,7 +767,7 @@ class World:
         # 数据采集
         self.data_collector = DataCollector()
 
-        # 6组实验管理：1-3 跟驰策略, 4-6 超车(40/60/80)
+        # 6组实验管理：1-3 跟驰策略, 4-6 超车(35/50/65 km/h)
         self.experiment_plan = []
         for exp_type in FOLLOWING_EXPERIMENT_TYPES:
             self.experiment_plan.append({
@@ -834,6 +834,15 @@ class World:
         if exp['type'] == 'following_irregular':
             return f"实验{self.experiment_index + 1}/6 跟驰-不规则变速"
         return f"实验{self.experiment_index + 1}/6 超车 {exp['speed_kmh']:.0f}km/h"
+
+    def _get_experiment_sidebar_title(self):
+        """侧边栏实验组标题：跟驰实验1~3、超车实验1~3（与 experiment_index 0~5 对应）。"""
+        exp = self._get_current_experiment()
+        if not exp:
+            return ""
+        if exp['type'].startswith('following_'):
+            return f"跟驰实验{self.experiment_index + 1}"
+        return f"超车实验{self.experiment_index - 2}"
 
     def _get_effective_lead_speed(self):
         exp = self._get_current_experiment()
@@ -1425,6 +1434,11 @@ class VehicleController:
         self.cabin_socket = None
         self.cabin_ip = args.cabin_ip
         self.cabin_port = args.cabin_port
+        self._cabin_echo_interval = float(getattr(args, 'cabin_echo_interval', 0.0) or 0.0)
+        self._last_cabin_echo_time = 0.0
+        self._last_cabin_apply_echo_time = 0.0
+        self._cabin_stuck_since = None
+        self._last_cabin_nudge_time = 0.0
         
         if self.input_mode == 'cabin':
             self._setup_cabin_connection()
@@ -1651,11 +1665,17 @@ class VehicleController:
                         
                     # P: 自动驾驶
                     elif event.key == K_p and not (pygame.key.get_mods() & KMOD_CTRL):
-                        if not self._autopilot_enabled and not sync_mode:
-                            print("警告: 异步模式下自动驾驶可能不稳定")
-                        self._autopilot_enabled = not self._autopilot_enabled
-                        world.player.set_autopilot(self._autopilot_enabled)
-                        world.hud.notification('CARLA自动驾驶 %s' % ('开启' if self._autopilot_enabled else '关闭'))
+                        if self.input_mode == 'cabin':
+                            # 对齐 DriveSim 的驾驶舱控制思路：驾驶舱接管时不让 CARLA autopilot 抢控制
+                            self._autopilot_enabled = False
+                            world.player.set_autopilot(False)
+                            world.hud.notification('驾驶舱模式下已禁用CARLA自动驾驶')
+                        else:
+                            if not self._autopilot_enabled and not sync_mode:
+                                print("警告: 异步模式下自动驾驶可能不稳定")
+                            self._autopilot_enabled = not self._autopilot_enabled
+                            world.player.set_autopilot(self._autopilot_enabled)
+                            world.hud.notification('CARLA自动驾驶 %s' % ('开启' if self._autopilot_enabled else '关闭'))
                         
                     # L: 车灯控制
                     elif event.key == K_l and pygame.key.get_mods() & KMOD_CTRL:
@@ -1689,13 +1709,18 @@ class VehicleController:
                         current_lights ^= carla.VehicleLightState.RightBlinker
                         
         # 获取控制输入
+        # 驾驶舱模式强制关闭 CARLA autopilot，避免油门/制动被覆盖
+        if self.input_mode == 'cabin' and self._autopilot_enabled:
+            self._autopilot_enabled = False
+            world.player.set_autopilot(False)
+
         if not self._autopilot_enabled:
-            if self.control_mode == 'manual':
-                if self.input_mode == 'cabin' and self.cabin_socket:
-                    self._parse_cabin_input(world)
-                else:
-                    self._parse_keyboard_input(pygame.key.get_pressed(), clock.get_time())
-                    self._control.reverse = self._control.gear < 0
+            # 驾驶舱优先：不受 F2「跟驰自动驾驶」影响，否则油门被 IDM 覆盖；也不走 Ackermann 分支
+            if self.input_mode == 'cabin' and self.cabin_socket:
+                self._parse_cabin_input(world)
+            elif self.control_mode == 'manual':
+                self._parse_keyboard_input(pygame.key.get_pressed(), clock.get_time())
+                self._control.reverse = self._control.gear < 0
             else:
                 self._compute_autopilot_control(world)
                 
@@ -1713,12 +1738,51 @@ class VehicleController:
                 self._lights = current_lights
                 world.player.set_light_state(carla.VehicleLightState(self._lights))
                 
-            # 应用控制
-            if not self._ackermann_enabled:
+            # 应用控制（驾驶舱协议只填充 VehicleControl；若误开 Ackermann(F)，apply_ackermann 会忽略油门）
+            if self.input_mode == 'cabin' or not self._ackermann_enabled:
                 world.player.apply_control(self._control)
             else:
                 world.player.apply_ackermann_control(self._ackermann_control)
                 self._control = world.player.get_control()
+
+            if self.input_mode == 'cabin' and self._cabin_echo_interval > 0:
+                now = time.time()
+                if now - self._last_cabin_apply_echo_time >= self._cabin_echo_interval:
+                    self._last_cabin_apply_echo_time = now
+                    v_apply = world.player.get_velocity()
+                    speed_apply = 3.6 * math.sqrt(v_apply.x**2 + v_apply.y**2 + v_apply.z**2)
+                    c_apply = world.player.get_control()
+                    print(
+                        "[驾驶舱控制生效] "
+                        f"车速={speed_apply:.2f} km/h "
+                        f"throttle={c_apply.throttle:.3f} brake={c_apply.brake:.3f} "
+                        f"hand_brake={int(c_apply.hand_brake)} gear={c_apply.gear} "
+                        f"manual={int(c_apply.manual_gear_shift)} reverse={int(c_apply.reverse)}"
+                    )
+
+            # 驾驶舱起步助推：控制量正常但长期低速时，给一个轻微前向速度脉冲帮助车辆脱离静止
+            if self.input_mode == 'cabin':
+                now = time.time()
+                v_apply = world.player.get_velocity()
+                speed_apply = 3.6 * math.sqrt(v_apply.x**2 + v_apply.y**2 + v_apply.z**2)
+                c_apply = world.player.get_control()
+                stuck_condition = (
+                    c_apply.throttle > 0.45 and
+                    c_apply.brake < 0.05 and
+                    not c_apply.hand_brake and
+                    not c_apply.reverse and
+                    speed_apply < 0.4
+                )
+                if stuck_condition:
+                    if self._cabin_stuck_since is None:
+                        self._cabin_stuck_since = now
+                    elif now - self._cabin_stuck_since > 1.2 and now - self._last_cabin_nudge_time > 0.8:
+                        fwd = world.player.get_transform().get_forward_vector()
+                        world.player.set_target_velocity(carla.Vector3D(fwd.x * 2.0, fwd.y * 2.0, 0.0))
+                        self._last_cabin_nudge_time = now
+                        print(f"[驾驶舱起步助推] throttle={c_apply.throttle:.3f} speed={speed_apply:.2f}km/h -> nudge 2.0m/s")
+                else:
+                    self._cabin_stuck_since = None
                 
         # 采集数据
         if world.data_collector.is_collecting and world.lead_vehicle:
@@ -1811,9 +1875,26 @@ class VehicleController:
             message, _ = self.cabin_socket.recvfrom(164)
             data = struct.unpack('<LfffffffffLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL', message)
             
+            if self._cabin_echo_interval > 0:
+                now = time.time()
+                if now - self._last_cabin_echo_time >= self._cabin_echo_interval:
+                    self._last_cabin_echo_time = now
+                    preview = message[: min(48, len(message))].hex()
+                    print(
+                        "[驾驶舱回传] "
+                        f"len={len(message)} "
+                        f"hdr={data[0]} "
+                        f"tx_speed={speed:.2f}km/h tx_rpm={engine_rpm:.1f} "
+                        f"油门={data[1]:.3f} 制动={data[2]:.3f} f3={data[3]:.3f} "
+                        f"转向={data[4]:.3f} 手刹={data[5]:.3f} "
+                        f"开关量有效={data[10]} "
+                        f"D/N/P/R={data[33]}/{data[35]}/{data[34]}/{data[36]} "
+                        f"| hex48={preview}"
+                    )
+            
             lights = 0
-            # 未下发开关量时回到自动档，避免手动挡卡在 N 档导致油门无效
-            self._control.manual_gear_shift = bool(data[10] > 0)
+            # 对齐 DriveSim1005：驾驶舱输入下固定使用手动挡逻辑
+            self._control.manual_gear_shift = True
             
             if data[0] > 0:
                 # 处理模拟量: 油门(data[1]), 制动(data[2]), 方向盘(data[4]), 手刹(data[5])
@@ -1875,7 +1956,7 @@ class VehicleController:
                     
                 # 挡位
                 self._control.reverse = False
-                if data[33] > 0:  # D档
+                if data[33] > 0:  # D档：使用2档（更高极速；低速扭矩不足时可改回1档）
                     self._control.gear = 2
                 elif data[35] > 0:  # N档
                     self._control.gear = 0
@@ -2058,6 +2139,7 @@ class HUD:
         if world._use_experiment_mode():
             self._info_text.extend([
                 '',
+                '%s' % world._get_experiment_sidebar_title(),
                 '实验: %15s' % world._get_experiment_label(),
                 '按键: F4/F5~F10 切换并重启'
             ])
@@ -2653,11 +2735,19 @@ def game_loop(args):
         print("=" * 60)
         print(f"\n输入模式: {args.input_mode}")
         print(f"显示器: {args.display}")
+        ls_ms = args.lead_speed
+        print(f"前车基准速度(--lead-speed): {ls_ms:.2f} m/s ({ls_ms * 3.6:.1f} km/h)")
         if args.enable_experiment_mode:
             print("实验计划: 1-3 跟驰(缓变/急变/不规则) + 4-6 超车(40/60/80), 每次重启跑完整6km")
             print(f"当前实验: {world._get_experiment_label()}")
-        else:
-            print(f"前车基准速度: {args.lead_speed * 3.6:.0f} km/h")
+            eff = world._get_effective_lead_speed()
+            print(
+                f"当前实验前车目标速度: {eff:.2f} m/s ({eff * 3.6:.1f} km/h) "
+                f"(跟驰段用上面基准速度; 超车段为实验设定)"
+            )
+        if args.input_mode == 'cabin' and float(getattr(args, 'cabin_echo_interval', 0) or 0) > 0:
+            ce = float(args.cabin_echo_interval)
+            print(f"驾驶舱回传打印: 每 {ce:.2f}s 一行（关闭: --cabin-echo-interval 0）")
         print()
         
         hud.notification("按 F1 开始数据采集, H 显示帮助", seconds=5.0)
@@ -2766,6 +2856,13 @@ def main():
     # 驾驶舱通信设置
     argparser.add_argument('--cabin-ip', default=CABIN_IP, help='驾驶舱IP地址')
     argparser.add_argument('--cabin-port', default=CABIN_PORT, type=int, help='驾驶舱端口')
+    argparser.add_argument(
+        '--cabin-echo-interval',
+        default=None,
+        type=float,
+        metavar='N',
+        help='终端打印驾驶舱 UDP 回传间隔(秒)，须填数字，例如 0.25；0=关闭。默认 cabin=0.25、键盘=0',
+    )
     
     args = argparser.parse_args()
     
@@ -2780,6 +2877,9 @@ def main():
 
     # 直道实验默认启用；也可显式 --six-experiments 开启
     args.enable_experiment_mode = args.six_experiments or args.straight_road or bool(args.opendrive)
+    
+    if args.cabin_echo_interval is None:
+        args.cabin_echo_interval = 0.25 if args.input_mode == 'cabin' else 0.0
     
     print(__doc__)
     
