@@ -105,6 +105,21 @@ def find_ego_vehicle(world, role_name='hero', timeout=30):
     return None
 
 
+def find_ego_vehicle_once(world, role_name='hero'):
+    """仅做一次快速查找（不 sleep），用于 hero 重启后的自动重绑。"""
+    try:
+        actor_list = world.get_actors().filter('vehicle.*')
+        for vehicle in actor_list:
+            try:
+                if vehicle.attributes.get('role_name') == role_name:
+                    return vehicle
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
 def set_window_position(x, y):
     """设置窗口位置 (跨平台)"""
     os.environ['SDL_VIDEO_WINDOW_POS'] = f'{x},{y}'
@@ -160,6 +175,8 @@ def main():
     argparser.add_argument('--pos-x', default=0, type=int, help='窗口X位置（相对该显示器左上角）')
     argparser.add_argument('--pos-y', default=650, type=int, help='窗口Y位置（相对该显示器左上角）')
     argparser.add_argument('--rolename', default='hero', help='主车角色名')
+    argparser.add_argument('--rebind-interval', default=1.0, type=float,
+                          help='当 hero 重启/切换实验后自动重绑相机的检测间隔(秒)')
     args = argparser.parse_args()
     
     CAMERA_CONFIG['width'] = args.width
@@ -198,6 +215,8 @@ def main():
         
         print(f"\n[{CAMERA_CONFIG['name']}] 运行中...")
         print("按 ESC 或关闭窗口退出")
+
+        last_rebind_check = 0.0
         
         while True:
             clock.tick_busy_loop(30)
@@ -208,6 +227,19 @@ def main():
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         return
+
+            now = time.time()
+            if now - last_rebind_check >= args.rebind_interval:
+                last_rebind_check = now
+                new_car = find_ego_vehicle_once(world, args.rolename)
+                new_id = getattr(new_car, "id", None) if new_car is not None else None
+                cur_id = getattr(car, "id", None) if car is not None else None
+                if new_car is not None and (car is None or new_id != cur_id):
+                    car = new_car
+                    if sensor:
+                        sensor.destroy()
+                    sensor = SensorManager(world, car, CAMERA_CONFIG)
+                    print(f"[{CAMERA_CONFIG['name']}] hero 已重绑 (id {cur_id} -> {new_id})")
                         
             world.wait_for_tick()
             sensor.render(display)

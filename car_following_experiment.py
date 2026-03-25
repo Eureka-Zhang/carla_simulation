@@ -781,6 +781,16 @@ class World:
         self.experiment_index = 0
         self.experiment_duration_s = 200.0
         self.experiment_start_sim_time = None
+
+        # 每个实验开始前的冷却时间：用于先打开窗口/录制，再开始让前车起步
+        # 冷却期内跳过 lead_controller.update，并强制前车速度为 0
+        self.experiment_cooldown_s = float(getattr(args, 'experiment_cooldown_s', 20.0))
+        self._experiment_cooldown_active = False
+        self._experiment_cooldown_start_sim_time = None
+        self.cooldown_remaining_s = 0.0
+
+        # 自动采集：冷却结束后开始；切换实验/重启/退出时停止
+        self._experiment_record_started = False
         
         # 配置
         self._weather_presets = find_weather_presets()
@@ -888,6 +898,9 @@ class World:
         if not self._use_experiment_mode():
             self.hud.notification("未启用6组实验模式", seconds=2.0)
             return
+        # 切换实验前强制停止数据采集，保证每个实验独立文件
+        if self.data_collector and self.data_collector.is_collecting:
+            self.data_collector.stop()
         self.experiment_index = max(0, min(len(self.experiment_plan) - 1, index))
         self.experiment_start_sim_time = None
         print(f"[实验切换] -> {self._get_experiment_label()}")
@@ -898,6 +911,9 @@ class World:
         if not self._use_experiment_mode():
             self.hud.notification("未启用6组实验模式", seconds=2.0)
             return
+        # 切换实验前强制停止数据采集，保证每个实验独立文件
+        if self.data_collector and self.data_collector.is_collecting:
+            self.data_collector.stop()
         self.experiment_index = (self.experiment_index + 1) % len(self.experiment_plan)
         self.experiment_start_sim_time = None
         print(f"[实验切换] -> {self._get_experiment_label()}")
@@ -907,6 +923,20 @@ class World:
     def restart(self):
         self.player_max_speed = 1.589
         self.player_max_speed_fast = 3.713
+
+        # 只有启用 6 组实验切换时，才做“每次实验开始前冷却”
+        if self._use_experiment_mode():
+            # 重启/重建车辆时，强制停止数据采集（避免跨实验写入同一个文件）
+            if self.data_collector and self.data_collector.is_collecting:
+                self.data_collector.stop()
+            self._experiment_record_started = False
+            self._experiment_cooldown_active = True
+            self._experiment_cooldown_start_sim_time = None
+            self.cooldown_remaining_s = self.experiment_cooldown_s
+        else:
+            self._experiment_cooldown_active = False
+            self._experiment_cooldown_start_sim_time = None
+            self.cooldown_remaining_s = 0.0
         
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
@@ -1285,15 +1315,43 @@ class World:
         # 获取仿真时间并传递给前车控制器
         sim_time = self.hud.simulation_time if hasattr(self.hud, 'simulation_time') else None
         if self.lead_controller:
-            self.lead_controller.update(sim_time)
+            if self._experiment_cooldown_active:
+                # 冷却期内保持前车速度为 0，并跳过 lead_controller.update（避免提前起步）
+                # 冷却期内不采集数据（避免记录到“启动前静止”阶段以外的数据）
+                if self.data_collector and self.data_collector.is_collecting:
+                    self.data_collector.stop()
+                if sim_time is not None:
+                    if self._experiment_cooldown_start_sim_time is None:
+                        self._experiment_cooldown_start_sim_time = sim_time
+                    elapsed = sim_time - self._experiment_cooldown_start_sim_time
+                    remaining = self.experiment_cooldown_s - elapsed
+                    self.cooldown_remaining_s = max(0.0, remaining)
+                    if remaining <= 0.0:
+                        self._experiment_cooldown_active = False
+                        self.cooldown_remaining_s = 0.0
+                        # 倒计时结束：自动开始数据采集（每个实验独立文件）
+                        if not self._experiment_record_started and self.lead_controller:
+                            exp_id = self.experiment_index + 1
+                            ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]  # 毫秒级唯一
+                            save_dir = f'./experiment_data/{ts}_exp{exp_id}'
+                            save_path = os.path.join(save_dir, 'driving_data.csv')
+                            self.data_collector.start(save_path, self.lead_controller)
+                            self._experiment_record_started = True
+                            self.hud.notification(f'自动开始数据采集 (实验{exp_id})', seconds=2.0)
+                    else:
+                        if self.lead_vehicle:
+                            self.lead_vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            if not self._experiment_cooldown_active:
+                self.lead_controller.update(sim_time)
 
-        # 实验模式：每 200s 自动切换到下一场景
+        # 实验模式：冷却结束后开始计时（每 200s 自动切换到下一场景）
         if self._use_experiment_mode() and sim_time is not None:
-            if self.experiment_start_sim_time is None:
-                self.experiment_start_sim_time = sim_time
-            elif sim_time - self.experiment_start_sim_time >= self.experiment_duration_s:
-                self.switch_to_next_experiment()
-                return
+            if not self._experiment_cooldown_active:
+                if self.experiment_start_sim_time is None:
+                    self.experiment_start_sim_time = sim_time
+                elif sim_time - self.experiment_start_sim_time >= self.experiment_duration_s:
+                    self.switch_to_next_experiment()
+                    return
         
         # 直道保护（默认关闭，只在明确指定 --auto-reset 时启用）
         if getattr(self.args, 'auto_reset', False) and self.player:
@@ -1492,14 +1550,17 @@ class VehicleController:
                         
                 # F1: 开始/停止数据采集
                 elif event.key == K_F1:
-                    if world.data_collector.is_collecting:
-                        world.data_collector.stop()
-                        world.hud.notification("数据采集已停止")
+                    if world._use_experiment_mode():
+                        world.hud.notification("6组实验模式：采集由冷却倒计时自动控制，F1 无效", seconds=2.0)
                     else:
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        save_path = f'./experiment_data/{timestamp}/driving_data.csv'
-                        world.data_collector.start(save_path, world.lead_controller)
-                        world.hud.notification("数据采集已开始")
+                        if world.data_collector.is_collecting:
+                            world.data_collector.stop()
+                            world.hud.notification("数据采集已停止")
+                        else:
+                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            save_path = f'./experiment_data/{timestamp}/driving_data.csv'
+                            world.data_collector.start(save_path, world.lead_controller)
+                            world.hud.notification("数据采集已开始")
                         
                 # F2: 切换控制模式
                 elif event.key == K_F2:
@@ -2086,6 +2147,7 @@ class HUD:
         self._server_clock = pygame.time.Clock()
         self._show_ackermann_info = False
         self._ackermann_control = carla.VehicleAckermannControl()
+        self._cooldown_remaining_s = 0.0
         
     def _init_fonts(self):
         chinese_font = find_chinese_font()
@@ -2114,6 +2176,7 @@ class HUD:
         
     def tick(self, world, clock):
         self._notifications.tick(world, clock)
+        self._cooldown_remaining_s = float(getattr(world, 'cooldown_remaining_s', 0.0) or 0.0)
         if not self._show_info:
             return
             
@@ -2209,6 +2272,11 @@ class HUD:
                     display.blit(surface, (8, v_offset))
                 v_offset += 18
         self._notifications.render(display)
+        # 右上角显示每个实验开始前的冷却倒计时
+        if self._cooldown_remaining_s > 0.0:
+            text = f"冷却: {self._cooldown_remaining_s:.0f}s"
+            surface = self._font_mono.render(text, True, (255, 255, 255))
+            display.blit(surface, (self.dim[0] - surface.get_width() - 10, 6))
         self.help.render(display)
 
 
@@ -2738,7 +2806,7 @@ def game_loop(args):
         ls_ms = args.lead_speed
         print(f"前车基准速度(--lead-speed): {ls_ms:.2f} m/s ({ls_ms * 3.6:.1f} km/h)")
         if args.enable_experiment_mode:
-            print("实验计划: 1-3 跟驰(缓变/急变/不规则) + 4-6 超车(40/60/80), 每次重启跑完整6km")
+            print("实验计划: 1-3 跟驰(缓变/急变/不规则) + 4-6 超车(35/50/65 km/h), 每次重启跑完整6km")
             print(f"当前实验: {world._get_experiment_label()}")
             eff = world._get_effective_lead_speed()
             print(
@@ -2841,7 +2909,9 @@ def main():
     argparser.add_argument('--lead-distance', default=50.0, type=float,
                           help='前车初始距离 (米)，默认50m')
     argparser.add_argument('--six-experiments', action='store_true',
-                          help='启用6组实验切换(1-3跟驰缓变/急变/不规则, 4-6超车40/60/80)')
+                          help='启用6组实验切换(1-3跟驰缓变/急变/不规则, 4-6超车35/50/65 km/h)')
+    argparser.add_argument('--experiment-cooldown-s', default=15.0, type=float,
+                          help='6组实验中：每次实验开始前冷却时间(秒)，冷却期前车速度保持0')
     argparser.add_argument('--experiment-start-x', default=EXPERIMENT_START_X, type=float,
                           help='6组实验重启时的起点X坐标')
     argparser.add_argument('--experiment-start-y', default=EXPERIMENT_START_Y, type=float,

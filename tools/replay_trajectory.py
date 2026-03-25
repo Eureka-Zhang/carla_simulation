@@ -185,6 +185,10 @@ def main():
     argparser.add_argument('--host', default='127.0.0.1', help='CARLA服务器IP')
     argparser.add_argument('-p', '--port', default=2000, type=int, help='CARLA服务器端口')
     argparser.add_argument('--speed', default=1.0, type=float, help='回放速度倍率 (默认1.0)')
+    argparser.add_argument('--seek-step-pct', default=1.0, type=float,
+                          help='进度跳转步长(占总帧百分比)。默认1%%，按←/→时生效')
+    argparser.add_argument('--seek-big-step-pct', default=10.0, type=float,
+                          help='进度大步跳转(占总帧百分比)。默认10%%，按PgUp/PgDn时生效')
     argparser.add_argument('--ego-vehicle', default='vehicle.audi.tt', help='自车蓝图')
     argparser.add_argument('--lead-vehicle', default='vehicle.tesla.model3', help='前车蓝图')
     argparser.add_argument('--loop', action='store_true', help='循环回放')
@@ -272,15 +276,59 @@ def main():
     
     print(f"\n开始回放 (速度: {args.speed}x)")
     print("按 ESC 退出, 空格键 暂停/继续, +/- 调整速度")
+    print("按 ←/→ 调整进度(默认1%%)，按 PgUp/PgDn 快速跳转(默认10%%)")
     
     try:
         running = True
         paused = False
         speed_mult = args.speed
-        
+
+        play_start_ts = trajectory[0]['timestamp']
+
         while running:
-            start_time = time.time()
+            wall_start = time.time()
             frame_idx = 0
+            seek_step_frames = max(1, int(len(trajectory) * (args.seek_step_pct / 100.0)))
+            seek_big_step_frames = max(1, int(len(trajectory) * (args.seek_big_step_pct / 100.0)))
+
+            def apply_frame(idx):
+                """将 CSV 中 idx 对应的帧状态应用到 CARLA 实体（不包含 world.tick）。"""
+                p = trajectory[idx]
+
+                # 自车变换
+                ego_transform = carla.Transform(
+                    carla.Location(x=p['ego_x'], y=p['ego_y'], z=0.5),
+                    carla.Rotation(yaw=p['ego_yaw'] if p['ego_yaw'] else 0)
+                )
+                ego_vehicle.set_transform(ego_transform)
+
+                # 自车速度（使用 recorded speed + recorded yaw）
+                if p['ego_speed'] > 0 and p['ego_yaw'] is not None:
+                    rad = math.radians(p['ego_yaw'])
+                    ego_velocity = carla.Vector3D(
+                        x=p['ego_speed'] * math.cos(rad),
+                        y=p['ego_speed'] * math.sin(rad),
+                        z=0
+                    )
+                    ego_vehicle.set_target_velocity(ego_velocity)
+
+                # 前车变换与速度
+                if lead_vehicle and p.get('lead_x') is not None:
+                    lead_transform = carla.Transform(
+                        carla.Location(x=p['lead_x'], y=p['lead_y'], z=0.5),
+                        carla.Rotation(yaw=p['lead_yaw'] if p.get('lead_yaw') else 0)
+                    )
+                    lead_vehicle.set_transform(lead_transform)
+
+                    lead_speed = p.get('lead_speed', 0)
+                    if lead_speed > 0 and p.get('lead_yaw') is not None:
+                        rad = math.radians(p['lead_yaw'])
+                        lead_velocity = carla.Vector3D(
+                            x=lead_speed * math.cos(rad),
+                            y=lead_speed * math.sin(rad),
+                            z=0
+                        )
+                        lead_vehicle.set_target_velocity(lead_velocity)
             
             while frame_idx < len(trajectory) and running:
                 # 事件处理
@@ -293,12 +341,64 @@ def main():
                         elif event.key == pygame.K_SPACE:
                             paused = not paused
                             print("暂停" if paused else "继续")
+                            if not paused:
+                                # 维持“暂停=冻结时间”的体验：对齐当前帧的目标时间
+                                cur = trajectory[frame_idx]
+                                cur_sim = cur['timestamp'] - play_start_ts
+                                wall_start = time.time() - (cur_sim / speed_mult)
                         elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
                             speed_mult = min(10.0, speed_mult + 0.5)
                             print(f"速度: {speed_mult}x")
+                            # 对齐当前帧时间，避免改速后跳帧
+                            cur = trajectory[frame_idx]
+                            cur_sim = cur['timestamp'] - play_start_ts
+                            wall_start = time.time() - (cur_sim / speed_mult)
                         elif event.key == pygame.K_MINUS:
                             speed_mult = max(0.1, speed_mult - 0.5)
                             print(f"速度: {speed_mult}x")
+                            cur = trajectory[frame_idx]
+                            cur_sim = cur['timestamp'] - play_start_ts
+                            wall_start = time.time() - (cur_sim / speed_mult)
+                        elif event.key == pygame.K_RIGHT:
+                            new_idx = min(len(trajectory) - 1, frame_idx + seek_step_frames)
+                            if new_idx != frame_idx:
+                                frame_idx = new_idx
+                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                                wall_start = time.time() - (cur_sim / speed_mult)
+                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
+                                if paused:
+                                    apply_frame(frame_idx)
+                                    world.tick()
+                        elif event.key == pygame.K_LEFT:
+                            new_idx = max(0, frame_idx - seek_step_frames)
+                            if new_idx != frame_idx:
+                                frame_idx = new_idx
+                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                                wall_start = time.time() - (cur_sim / speed_mult)
+                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
+                                if paused:
+                                    apply_frame(frame_idx)
+                                    world.tick()
+                        elif event.key == pygame.K_PAGEUP:
+                            new_idx = min(len(trajectory) - 1, frame_idx + seek_big_step_frames)
+                            if new_idx != frame_idx:
+                                frame_idx = new_idx
+                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                                wall_start = time.time() - (cur_sim / speed_mult)
+                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
+                                if paused:
+                                    apply_frame(frame_idx)
+                                    world.tick()
+                        elif event.key == pygame.K_PAGEDOWN:
+                            new_idx = max(0, frame_idx - seek_big_step_frames)
+                            if new_idx != frame_idx:
+                                frame_idx = new_idx
+                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                                wall_start = time.time() - (cur_sim / speed_mult)
+                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
+                                if paused:
+                                    apply_frame(frame_idx)
+                                    world.tick()
                 
                 if paused:
                     # 暂停时也要渲染
@@ -311,47 +411,16 @@ def main():
                 point = trajectory[frame_idx]
                 
                 # 计算目标时间
-                target_time = point['timestamp'] / speed_mult
-                elapsed = time.time() - start_time
+                sim_time = point['timestamp'] - play_start_ts
+                target_time = sim_time / speed_mult
+                elapsed = time.time() - wall_start
                 
                 # 等待到目标时间
                 if target_time > elapsed:
                     time.sleep(min(0.05, target_time - elapsed))
-                
-                # 更新自车位置
-                ego_transform = carla.Transform(
-                    carla.Location(x=point['ego_x'], y=point['ego_y'], z=0.5),
-                    carla.Rotation(yaw=point['ego_yaw'] if point['ego_yaw'] else 0)
-                )
-                ego_vehicle.set_transform(ego_transform)
-                
-                # 设置自车速度
-                if point['ego_speed'] > 0 and point['ego_yaw'] is not None:
-                    rad = math.radians(point['ego_yaw'])
-                    ego_velocity = carla.Vector3D(
-                        x=point['ego_speed'] * math.cos(rad),
-                        y=point['ego_speed'] * math.sin(rad),
-                        z=0
-                    )
-                    ego_vehicle.set_target_velocity(ego_velocity)
-                
-                # 更新前车位置
-                if lead_vehicle and point['lead_x'] is not None:
-                    lead_transform = carla.Transform(
-                        carla.Location(x=point['lead_x'], y=point['lead_y'], z=0.5),
-                        carla.Rotation(yaw=point['lead_yaw'] if point['lead_yaw'] else 0)
-                    )
-                    lead_vehicle.set_transform(lead_transform)
-                    
-                    # 设置前车速度
-                    if point.get('lead_speed', 0) > 0 and point['lead_yaw'] is not None:
-                        rad = math.radians(point['lead_yaw'])
-                        lead_velocity = carla.Vector3D(
-                            x=point['lead_speed'] * math.cos(rad),
-                            y=point['lead_speed'] * math.sin(rad),
-                            z=0
-                        )
-                        lead_vehicle.set_target_velocity(lead_velocity)
+
+                # 更新自车/前车状态（由 CSV 驱动）
+                apply_frame(frame_idx)
                 
                 # 更新世界
                 world.tick()
