@@ -779,7 +779,7 @@ class World:
                 'speed_kmh': speed_kmh,
             })
         self.experiment_index = 0
-        self.experiment_duration_s = 200.0
+        self.experiment_duration_s = 120.0
         self.experiment_start_sim_time = None
 
         # 每个实验开始前的冷却时间：用于先打开窗口/录制，再开始让前车起步
