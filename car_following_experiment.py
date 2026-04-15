@@ -550,7 +550,7 @@ class DataCollector:
         self.buffer_size = 100  # 缓冲区大小
         
         self.columns = [
-            'timestamp', 'frame',
+            'timestamp', 'real_world_time', 'real_world_unix', 'frame',
             'ego_speed', 'ego_acceleration', 'ego_jerk',
             'ego_pos_x', 'ego_pos_y', 'ego_yaw',
             'lead_pos_x', 'lead_pos_y', 'lead_yaw',
@@ -629,7 +629,9 @@ class DataCollector:
             return None
             
         try:
-            current_time = time.time() - self.start_time
+            wall_time_unix = time.time()
+            current_time = wall_time_unix - self.start_time
+            real_world_time = datetime.now().astimezone().isoformat(timespec='milliseconds')
             
             # 自车状态
             ego_transform = ego_vehicle.get_transform()
@@ -688,6 +690,8 @@ class DataCollector:
             
             data = {
                 'timestamp': round(current_time, 4),
+                'real_world_time': real_world_time,
+                'real_world_unix': round(wall_time_unix, 3),
                 'frame': self.frame_count,
                 'ego_speed': round(ego_speed, 4),
                 'ego_acceleration': round(ego_acceleration, 4),
@@ -894,6 +898,80 @@ class World:
         t.location.z += 0.3
         return t
 
+    def _apply_spawn_right_offset(self, transform):
+        """将生成点向右侧车道移动（优先按车道中心），必要时再做几何偏移。"""
+        if transform is None:
+            return None
+
+        # 拷贝一份，避免原始 spawn_points 被原地修改
+        shifted = carla.Transform(
+            carla.Location(
+                x=transform.location.x,
+                y=transform.location.y,
+                z=transform.location.z,
+            ),
+            carla.Rotation(
+                pitch=transform.rotation.pitch,
+                yaw=transform.rotation.yaw,
+                roll=transform.rotation.roll,
+            ),
+        )
+
+        right_offset_m = float(getattr(self.args, 'spawn_right_offset', 0.0) or 0.0)
+        if abs(right_offset_m) < 1e-6:
+            return shifted
+
+        # 优先使用 waypoint 邻接车道移动，确保落在可驾驶车道中心
+        try:
+            base_wp = self.map.get_waypoint(
+                shifted.location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving
+            )
+        except Exception:
+            base_wp = None
+
+        if base_wp is not None:
+            move_right = right_offset_m > 0
+            remain = abs(right_offset_m)
+            current_wp = base_wp
+            moved = False
+
+            while remain > 1e-6:
+                next_wp = current_wp.get_right_lane() if move_right else current_wp.get_left_lane()
+                if next_wp is None or next_wp.lane_type != carla.LaneType.Driving:
+                    break
+                current_wp = next_wp
+                remain = max(0.0, remain - max(float(getattr(current_wp, "lane_width", 0.0) or 0.0), 0.1))
+                moved = True
+
+            if moved:
+                shifted = current_wp.transform
+                shifted.location.z += 0.3
+                return shifted
+
+        # 如果没有邻接可驾驶车道，再退回几何偏移（兼容非标准地图）
+        right_vec = shifted.get_right_vector()
+        shifted.location.x += right_vec.x * right_offset_m
+        shifted.location.y += right_vec.y * right_offset_m
+        return shifted
+
+    def _cleanup_role_vehicles(self):
+        """
+        清理场景中残留的 hero / lead_vehicle，避免重启后叠车导致抖动或生成失败。
+        """
+        role_names = {self.actor_role_name, 'lead_vehicle'}
+        try:
+            for actor in self.world.get_actors().filter('vehicle.*'):
+                try:
+                    role_name = actor.attributes.get('role_name', '')
+                except Exception:
+                    role_name = ''
+                if role_name in role_names:
+                    actor.destroy()
+        except Exception:
+            pass
+
     def switch_to_experiment(self, index):
         if not self._use_experiment_mode():
             self.hud.notification("未启用6组实验模式", seconds=2.0)
@@ -958,9 +1036,15 @@ class World:
             self.player_max_speed = float(blueprint.get_attribute('speed').recommended_values[1])
             self.player_max_speed_fast = float(blueprint.get_attribute('speed').recommended_values[2])
             
-        # 销毁旧车辆
-        if self.player is not None:
+        # 重启前无条件清理旧对象 + 残留同角色车辆，避免“多前车/自车抖动”
+        try:
             self.destroy()
+        except Exception:
+            pass
+        self._cleanup_role_vehicles()
+        self.player = None
+        self.lead_vehicle = None
+        self.lead_controller = None
             
         # 选择生成点
         spawn_points = self.map.get_spawn_points()
@@ -1040,12 +1124,93 @@ class World:
             spawn_point = exp_spawn
             print(f"[实验] {self._get_experiment_label()} | 起点重置: ({spawn_point.location.x:.1f}, {spawn_point.location.y:.1f})")
 
-        # 生成自车
-        self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+        def _clone_transform(t):
+            return carla.Transform(
+                carla.Location(x=t.location.x, y=t.location.y, z=t.location.z),
+                carla.Rotation(pitch=t.rotation.pitch, yaw=t.rotation.yaw, roll=t.rotation.roll)
+            )
+
+        right_offset_m = float(getattr(self.args, 'spawn_right_offset', 0.0) or 0.0)
+        base_spawn_point = _clone_transform(spawn_point)
+        spawn_point = self._apply_spawn_right_offset(spawn_point)
+        if abs(right_offset_m) > 1e-6:
+            print(
+                f"[生成偏移] 向右平移 {right_offset_m:.2f}m -> "
+                f"({spawn_point.location.x:.1f}, {spawn_point.location.y:.1f})"
+            )
+
+        # 生成自车：优先尝试偏移后的右车道点，并在同车道前后少量探测可生成位置
+        candidate_spawns = []
+        candidate_spawns.append(_clone_transform(spawn_point))
+        for dz in [0.3, 0.8]:
+            t = _clone_transform(spawn_point)
+            t.location.z += dz
+            candidate_spawns.append(t)
+
+        if abs(right_offset_m) > 1e-6:
+            try:
+                wp = self.map.get_waypoint(
+                    spawn_point.location,
+                    project_to_road=True,
+                    lane_type=carla.LaneType.Driving
+                )
+            except Exception:
+                wp = None
+
+            if wp is not None:
+                for step in [5.0, 10.0, -5.0, -10.0]:
+                    next_wp = None
+                    if step > 0:
+                        cands = wp.next(step)
+                    else:
+                        cands = wp.previous(abs(step))
+                    if cands:
+                        next_wp = cands[0]
+                    if next_wp is not None:
+                        t = _clone_transform(next_wp.transform)
+                        t.location.z += 0.3
+                        candidate_spawns.append(t)
+
+        # 去重（按位置近似）
+        dedup = []
+        seen = set()
+        for t in candidate_spawns:
+            key = (round(t.location.x, 2), round(t.location.y, 2), round(t.location.z, 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(t)
+        candidate_spawns = dedup
+
+        self.player = None
+        for cand in candidate_spawns:
+            self.player = self.world.try_spawn_actor(blueprint, cand)
+            if self.player is not None:
+                spawn_point = cand
+                break
+
+        # 偏移失败时，回退原始生成点，避免直接退出
+        if self.player is None and abs(right_offset_m) > 1e-6:
+            self.player = self.world.try_spawn_actor(blueprint, base_spawn_point)
+            if self.player is not None:
+                spawn_point = base_spawn_point
+                print("[生成偏移] 右车道生成失败，已回退到原始车道生成。")
+
         retry_count = 0
         while self.player is None and retry_count < 10:
-            spawn_point = random.choice(spawn_points)
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
+            raw_spawn = random.choice(spawn_points)
+            shifted_spawn = self._apply_spawn_right_offset(raw_spawn)
+
+            # 先试偏移后的点，再试原始点
+            self.player = self.world.try_spawn_actor(blueprint, shifted_spawn)
+            if self.player is not None:
+                spawn_point = shifted_spawn
+                break
+
+            self.player = self.world.try_spawn_actor(blueprint, raw_spawn)
+            if self.player is not None:
+                spawn_point = raw_spawn
+                break
             retry_count += 1
             
         if self.player is None:
@@ -1813,8 +1978,11 @@ class VehicleController:
                     v_apply = world.player.get_velocity()
                     speed_apply = 3.6 * math.sqrt(v_apply.x**2 + v_apply.y**2 + v_apply.z**2)
                     c_apply = world.player.get_control()
+                    sim_time = world.hud.simulation_time if hasattr(world, 'hud') and hasattr(world.hud, 'simulation_time') else None
+                    sim_time_str = f"{sim_time:.2f}s" if sim_time is not None else "N/A"
                     print(
                         "[驾驶舱控制生效] "
+                        f"world_time={sim_time_str} "
                         f"车速={speed_apply:.2f} km/h "
                         f"throttle={c_apply.throttle:.3f} brake={c_apply.brake:.3f} "
                         f"hand_brake={int(c_apply.hand_brake)} gear={c_apply.gear} "
@@ -1841,7 +2009,9 @@ class VehicleController:
                         fwd = world.player.get_transform().get_forward_vector()
                         world.player.set_target_velocity(carla.Vector3D(fwd.x * 2.0, fwd.y * 2.0, 0.0))
                         self._last_cabin_nudge_time = now
-                        print(f"[驾驶舱起步助推] throttle={c_apply.throttle:.3f} speed={speed_apply:.2f}km/h -> nudge 2.0m/s")
+                        sim_time = world.hud.simulation_time if hasattr(world, 'hud') and hasattr(world.hud, 'simulation_time') else None
+                        sim_time_str = f"{sim_time:.2f}s" if sim_time is not None else "N/A"
+                        print(f"[驾驶舱起步助推] world_time={sim_time_str} throttle={c_apply.throttle:.3f} speed={speed_apply:.2f}km/h -> nudge 2.0m/s")
                 else:
                     self._cabin_stuck_since = None
                 
@@ -1941,8 +2111,11 @@ class VehicleController:
                 if now - self._last_cabin_echo_time >= self._cabin_echo_interval:
                     self._last_cabin_echo_time = now
                     preview = message[: min(48, len(message))].hex()
+                    sim_time = world.hud.simulation_time if hasattr(world, 'hud') and hasattr(world.hud, 'simulation_time') else None
+                    sim_time_str = f"{sim_time:.2f}s" if sim_time is not None else "N/A"
                     print(
                         "[驾驶舱回传] "
+                        f"world_time={sim_time_str} "
                         f"len={len(message)} "
                         f"hdr={data[0]} "
                         f"tx_speed={speed:.2f}km/h tx_rpm={engine_rpm:.1f} "
@@ -2148,6 +2321,7 @@ class HUD:
         self._show_ackermann_info = False
         self._ackermann_control = carla.VehicleAckermannControl()
         self._cooldown_remaining_s = 0.0
+        self.show_lane_invasion_notification = True
         
     def _init_fonts(self):
         chinese_font = find_chinese_font()
@@ -2206,35 +2380,25 @@ class HUD:
                 '实验: %15s' % world._get_experiment_label(),
                 '按键: F4/F5~F10 切换并重启'
             ])
-        
-        # 前车信息
+
+        # 前车信息（仅显示速度和车头间距）
         if world.lead_vehicle:
             lead_loc = world.lead_vehicle.get_location()
             lead_vel = world.lead_vehicle.get_velocity()
             lead_speed = 3.6 * math.sqrt(lead_vel.x**2 + lead_vel.y**2 + lead_vel.z**2)
-            
+
             distance = math.sqrt(
-                (t.location.x - lead_loc.x)**2 + 
+                (t.location.x - lead_loc.x)**2 +
                 (t.location.y - lead_loc.y)**2
             )
-            
+
             self._info_text.extend([
                 '',
                 '--- 跟驰信息 ---',
                 '前车速度: %9.0f km/h' % lead_speed,
                 '车头间距: %9.1f m' % distance,
             ])
-            
-            if speed > 1:
-                thw = distance / (speed / 3.6)
-                self._info_text.append('时距: %13.1f s' % thw)
-                
-                # TTC
-                rel_speed = (speed - lead_speed) / 3.6
-                if rel_speed > 0.1:
-                    ttc = distance / rel_speed
-                    self._info_text.append('TTC: %14.1f s' % min(ttc, 999))
-                    
+        
         # 数据采集状态
         if world.data_collector.is_collecting:
             self._info_text.extend([
@@ -2376,6 +2540,8 @@ class LaneInvasionSensor:
     def _on_invasion(weak_self, event):
         self = weak_self()
         if not self:
+            return
+        if not getattr(self.hud, 'show_lane_invasion_notification', True):
             return
         lane_types = set(x.type for x in event.crossed_lane_markings)
         text = ['%r' % str(x).split()[-1] for x in lane_types]
@@ -2767,6 +2933,7 @@ def game_loop(args):
         pygame.display.set_caption("跟驰实验 - 主视角")
 
         hud = HUD(args.width, args.height)
+        hud.show_lane_invasion_notification = bool(getattr(args, 'show_lane_invasion_notification', False))
         world = World(sim_world, hud, args)
         controller = VehicleController(world, args)
 
@@ -2803,6 +2970,8 @@ def game_loop(args):
         print("=" * 60)
         print(f"\n输入模式: {args.input_mode}")
         print(f"显示器: {args.display}")
+        print(f"压线提示显示: {'开启' if hud.show_lane_invasion_notification else '关闭'}")
+        print(f"生成右移偏移(--spawn-right-offset): {args.spawn_right_offset:.2f} m")
         ls_ms = args.lead_speed
         print(f"前车基准速度(--lead-speed): {ls_ms:.2f} m/s ({ls_ms * 3.6:.1f} km/h)")
         if args.enable_experiment_mode:
@@ -2878,6 +3047,8 @@ def main():
     argparser.add_argument('--gamma', default=2.2, type=float, help='Gamma校正')
     argparser.add_argument('--display', default=0, type=int, help='显示器编号 (0, 1, 2...)')
     argparser.add_argument('--fullscreen', action='store_true', help='全屏模式')
+    argparser.add_argument('--show-lane-invasion-notification', action='store_true',
+                          help='显示屏幕下方压线提示（默认关闭）')
     
     # 车辆设置
     argparser.add_argument('--filter', default='vehicle.audi.tt', help='自车蓝图')
@@ -2908,6 +3079,8 @@ def main():
                           help='列出所有生成点后退出')
     argparser.add_argument('--lead-distance', default=50.0, type=float,
                           help='前车初始距离 (米)，默认50m')
+    argparser.add_argument('--spawn-right-offset', default=2.5, type=float,
+                          help='自车/前车生成点向右平移(米)，例如 3.5 表示右移一个车道宽')
     argparser.add_argument('--six-experiments', action='store_true',
                           help='启用6组实验切换(1-3跟驰缓变/急变/不规则, 4-6超车35/50/65 km/h)')
     argparser.add_argument('--experiment-cooldown-s', default=15.0, type=float,

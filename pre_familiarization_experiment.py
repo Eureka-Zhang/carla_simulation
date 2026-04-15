@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-前置熟悉实验（不采集数据）
+前置熟悉实验（默认采集数据）
 
 两个阶段合计 5min（每阶段 2.5min）：
 1) 跟驰：在大屏显示“请进行跟驰”
@@ -14,6 +14,7 @@ import argparse
 import os
 import time
 import math
+from datetime import datetime
 
 import pygame
 import carla
@@ -236,6 +237,12 @@ def main():
     controller = cfe.VehicleController(world, args)
     keyboard_driver = KeyboardDriver()  # 仅 keyboard 模式使用
 
+    # 前置熟悉实验默认开启数据采集（CSV + metadata）
+    record_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    record_save_path = f"./experiment_data/pre_familiarization_{record_ts}/driving_data.csv"
+    world.data_collector.start(record_save_path, world.lead_controller)
+    hud.notification("前置熟悉实验数据采集中", seconds=3.0)
+
     # 由于我们要在大屏显示中文：复用主脚本的中文字体查找
     chinese_font = cfe.find_chinese_font()
     if chinese_font:
@@ -406,10 +413,22 @@ def main():
                 if dt_ms <= 0:
                     dt_ms = 33
                 ctrl = keyboard_driver.update(keys, dt_ms)
+                applied_ctrl = ctrl
                 if phase_pause_active:
-                    world.player.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0, steer=0.0))
+                    applied_ctrl = carla.VehicleControl(throttle=0.0, brake=0.0, steer=0.0)
+                    world.player.apply_control(applied_ctrl)
                 else:
-                    world.player.apply_control(ctrl)
+                    world.player.apply_control(applied_ctrl)
+
+                # keyboard 模式未经过 controller.parse_events，需要在此手动采集数据
+                if world.data_collector.is_collecting and world.player is not None and world.lead_vehicle is not None:
+                    world.data_collector.collect(
+                        world.player,
+                        world.lead_vehicle,
+                        applied_ctrl,
+                        "manual",
+                        world.lead_controller,
+                    )
             else:
                 # cabin 模式：让主脚本的 UDP 输入逻辑接管事件
                 if controller.parse_events(client, world, clock, args.sync):
@@ -586,6 +605,11 @@ def main():
                 pause_end_wall = time.time() + float(args.pre_start_pause_s)
 
     finally:
+        if world is not None and world.data_collector and world.data_collector.is_collecting:
+            saved_path = world.data_collector.stop()
+            if saved_path:
+                print(f"[前置熟悉实验] 数据已保存: {saved_path}")
+
         # 恢复同步设置
         if args.sync:
             sim_world.apply_settings(original_settings)
