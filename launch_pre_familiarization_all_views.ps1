@@ -1,8 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-# 一键启动主视角 + 多相机视角（每个进程一个独立终端窗口）
+# 一键启动前置熟悉实验主视角 + 多相机视角（每个进程一个独立终端窗口）
 # 用法：
-#   1) 在项目根目录执行：powershell -ExecutionPolicy Bypass -File .\launch_all_views.ps1
+#   1) 在项目根目录执行：powershell -ExecutionPolicy Bypass -File .\launch_pre_familiarization_all_views.ps1
 #   2) 或直接右键“使用 PowerShell 运行”
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -19,8 +19,8 @@ $condaActivateBat = $condaActivateCandidates | Where-Object { Test-Path $_ } | S
 
 $jobs = @(
     @{
-        Title   = "CARLA Main View"
-        Command = "python .\car_following_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1600x900 --cabin-echo-interval 0.25 --six-experiments"
+        Title   = "CARLA Pre Familiarization Main View"
+        Command = "python .\pre_familiarization_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1600x900 --overtake-segment-duration-s 30 --overtake-cooldown-s 5 --overtake-speeds-kmh 35,50,65,75"
     },
     @{
         Title   = "CARLA Left Camera"
@@ -56,7 +56,7 @@ foreach ($job in $jobs) {
 }
 
 if ($condaActivateBat) {
-    Write-Host "已启动全部视角终端窗口（已配置 conda activate $condaEnvName）。" -ForegroundColor Green
+    Write-Host "已启动前置熟悉实验全部视角终端窗口（已配置 conda activate $condaEnvName）。" -ForegroundColor Green
 } else {
-    Write-Host "已启动全部视角终端窗口。未找到 activate.bat，将依赖 conda 命令可用性。" -ForegroundColor Yellow
+    Write-Host "已启动前置熟悉实验全部视角终端窗口。未找到 activate.bat，将依赖 conda 命令可用性。" -ForegroundColor Yellow
 }
