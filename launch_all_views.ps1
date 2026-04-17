@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 # 一键启动主视角 + 多相机视角（每个进程一个独立终端窗口）
 # 用法：
@@ -20,7 +20,7 @@ $condaActivateBat = $condaActivateCandidates | Where-Object { Test-Path $_ } | S
 $jobs = @(
     @{
         Title   = "CARLA Main View"
-        Command = "python .\car_following_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1600x900 --cabin-echo-interval 0.25 --six-experiments"
+        Command = "python .\car_following_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1920x1080 --cabin-echo-interval 0.25 --six-experiments"
     },
     @{
         Title   = "CARLA Left Camera"
@@ -36,11 +36,11 @@ $jobs = @(
     },
     @{
         Title   = "CARLA LeftBack Camera"
-        Command = "python .\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 820 --pos-y 730"
+        Command = "python .\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 900 --pos-y 700"
     },
     @{
         Title   = "CARLA RightBack Camera"
-        Command = "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 1050 --pos-y 800"
+        Command = "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 1050 --pos-y 760"
     }
 )
 

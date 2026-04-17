@@ -3,11 +3,12 @@
 """
 前置熟悉实验（默认采集数据）
 
-两个阶段合计 5min（每阶段 2.5min）：
-1) 跟驰：在大屏显示“请进行跟驰”
-2) 超车：在大屏显示“请进行超车”
+两个阶段手动切换键：F4（与主脚本一致）、F11、Insert、F12。
+按键拦截在 parse_events 之前，避免 cabin 模式下被主脚本的 F4 处理吞掉。
+1) 跟驰：按设定节奏进行不规则变速
+2) 超车：每次进入阶段都会重生车辆并置零速度，冷却10s后前车加速，达到目标速后提示“请进行超车”
 
-阶段切换时重置前车控制器，并可选重置前车/自车速度到 0（便于被试起步）。
+超车阶段最大时长 120s，超时后自动切回跟驰。
 """
 
 import argparse
@@ -15,8 +16,6 @@ import os
 import time
 import math
 from datetime import datetime
-from typing import Optional
-
 import pygame
 import carla
 
@@ -34,15 +33,16 @@ def fmt_mm_ss(seconds: float) -> str:
     return f"{mm:02d}:{ss:02d}"
 
 
-def draw_big_message(display, font_large, text: str, remaining_s: float, width: int, height: int):
-    """居中显示提示词与倒计时，统一字号与颜色。"""
+def draw_center_message(display, font_large, text: str, width: int, height: int):
+    """居中显示提示词（无倒计时）。"""
     color = (255, 255, 255)
     shadow_color = (0, 0, 0)
 
     lines = []
     if text:
         lines.append(str(text))
-    lines.append(f"倒计时: {fmt_mm_ss(remaining_s)}")
+    if not lines:
+        return
 
     surfaces = []
     for line in lines:
@@ -58,6 +58,34 @@ def draw_big_message(display, font_large, text: str, remaining_s: float, width: 
         display.blit(shadow, (x + 3, y + 3))
         display.blit(surf, (x, y))
         y += surf.get_height() + line_gap
+
+
+def draw_top_right_countdown(display, font_small, text: str, width: int):
+    """右上角显示实验倒计时。"""
+    if not text:
+        return
+    color = (255, 255, 255)
+    shadow_color = (0, 0, 0)
+    surf = font_small.render(text, True, color)
+    shadow = font_small.render(text, True, shadow_color)
+    x = max(12, width - surf.get_width() - 12)
+    y = 12
+    display.blit(shadow, (x + 2, y + 2))
+    display.blit(surf, (x, y))
+
+
+def draw_center_countdown(display, font_large, text: str, width: int, height: int):
+    """屏幕中央显示冷却倒计时。"""
+    if not text:
+        return
+    color = (255, 255, 255)
+    shadow_color = (0, 0, 0)
+    surf = font_large.render(text, True, color)
+    shadow = font_large.render(text, True, shadow_color)
+    x = (width - surf.get_width()) // 2
+    y = (height - surf.get_height()) // 2
+    display.blit(shadow, (x + 2, y + 2))
+    display.blit(surf, (x, y))
 
 
 class KeyboardDriver:
@@ -127,8 +155,8 @@ def main():
     argparser.add_argument("--lead-distance", default=50.0, type=float, help="前车初始距离（米）")
 
     # 控制模式
-    argparser.add_argument("--keyboard", action="store_true", help="使用键盘控制自车")
-    argparser.add_argument("--cabin", action="store_true", help="使用驾驶舱控制自车（需要 UDP）")
+    argparser.add_argument("--keyboard", action="store_true", help="使用键盘控制自车（默认使用驾驶舱）")
+    argparser.add_argument("--cabin", action="store_true", help="使用驾驶舱控制自车（默认启用，可省略）")
     argparser.add_argument("--cabin-ip", default=cfe.CABIN_IP, help="驾驶舱 IP")
     argparser.add_argument("--cabin-port", default=cfe.CABIN_PORT, type=int, help="驾驶舱端口")
     argparser.add_argument(
@@ -151,27 +179,24 @@ def main():
     argparser.add_argument("--follow-speed-kmh", default=65.0, type=float, help="跟驰阶段中心速度（km/h）")
     argparser.add_argument("--follow-amp-kmh", default=15.0, type=float, help="跟驰阶段不规则变速幅值（km/h）")
 
-    # 超车：4组速度，每组 30s，组间冷却 5s，总时长 135s（=4*30 + 3*5）
-    argparser.add_argument("--overtake-segment-duration-s", default=30.0, type=float, help="超车每组时长（秒），默认30s")
-    argparser.add_argument("--overtake-cooldown-s", default=5.0, type=float, help="超车组间冷却（秒），默认5s（冷却时前车速度为0）")
-    argparser.add_argument(
-        "--overtake-speeds-kmh",
-        default="35,50,65,75",
-        type=str,
-        help="超车阶段速度列表（km/h，用逗号分隔），默认 35,50,65,75",
-    )
+    # 超车阶段（模仿主实验逻辑）
+    argparser.add_argument("--overtake-speed-kmh", default=50.0, type=float, help="超车阶段前车目标速度（km/h）")
+    argparser.add_argument("--overtake-cooldown-s", default=10.0, type=float, help="超车阶段冷却时长（秒），默认10s")
+    argparser.add_argument("--overtake-max-duration-s", default=120.0, type=float, help="超车阶段最大时长（秒），默认120s")
 
     argparser.add_argument("--pre-start-pause-s", default=10.0, type=float, help="每阶段开始前暂停时间（秒），默认10s")
+    argparser.add_argument("--spawn-right-offset", default=3.5, type=float, help="生成点向右偏移（米），默认3.5m（右车道）")
 
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split("x")]
-    if args.cabin:
-        args.input_mode = "cabin"
-    else:
+    if args.keyboard:
         args.input_mode = "keyboard"
+    else:
+        args.input_mode = "cabin"
     if args.cabin_echo_interval is None:
         args.cabin_echo_interval = 0.25 if args.input_mode == "cabin" else 0.0
+    args.spawn_right_offset = abs(float(args.spawn_right_offset))
 
     # 主脚本 World.restart() / _get_effective_lead_speed() 依赖 args.lead_speed
     # 这里为“前车初始生成/默认基准”提供一个值；实际阶段内我们会在 reset_lead_for_phase() 再将前车速度置 0 并切换行为。
@@ -254,34 +279,32 @@ def main():
     chinese_font = cfe.find_chinese_font()
     if chinese_font:
         font_large = pygame.font.Font(chinese_font, 64)
+        font_small = pygame.font.Font(chinese_font, 32)
     else:
         font_large = pygame.font.Font(None, 64)
+        font_small = pygame.font.Font(None, 32)
 
     # 阶段配置
     phases = [
         ("following", "请进行跟驰", "following_irregular", kmh_to_ms(args.follow_speed_kmh)),
-        ("overtaking", "请进行跟驰", "overtaking_groups", 0.0),
+        ("overtaking", "请进行跟驰", "overtaking", kmh_to_ms(args.overtake_speed_kmh)),
     ]
 
     running = True
     phase_idx = 0
     phase_segment_idx = 0
     phase_record_started = {"following": False, "overtaking": False}
-
-    # 解析超车速度序列（km/h）
-    try:
-        overtake_speeds_kmh = [float(x.strip()) for x in str(args.overtake_speeds_kmh).split(",") if x.strip()]
-    except Exception:
-        overtake_speeds_kmh = [35.0, 50.0, 65.0, 75.0]
-    if not overtake_speeds_kmh:
-        overtake_speeds_kmh = [35.0, 50.0, 65.0, 75.0]
-    overtake_group_idx = 0
-    overtake_in_cooldown = False
-    overtake_group_start_wall = None
     overtake_phase_start_wall = None
-    overtake_prompt_until_wall = 0.0
+    overtake_cooldown_start_wall = None
+    overtake_prompt_pending = False
     overtake_speed_reached = False
-    overtake_active_group_idx = None
+    center_prompt_text = ""
+    center_prompt_until_wall = 0.0
+
+    def show_center_prompt(text: str, seconds: float = 1.5):
+        nonlocal center_prompt_text, center_prompt_until_wall
+        center_prompt_text = str(text)
+        center_prompt_until_wall = time.time() + max(0.0, float(seconds))
 
     def _start_segment_recording(phase_name: str):
         """开始某一阶段的分段采集（每次调用都会产生带时间戳的新文件）。"""
@@ -304,20 +327,6 @@ def main():
             world.lead_controller,
             world_start_time_s=sim_time,
         )
-        if phase_name == "overtaking" and getattr(world.data_collector, "metadata", None) is not None:
-            n = len(overtake_speeds_kmh)
-            world.data_collector.metadata["overtaking_group_world_time"] = [
-                {
-                    "group_index": i + 1,
-                    "target_speed_kmh": float(overtake_speeds_kmh[i]),
-                    "start_world_time_s": None,
-                    "end_world_time_s": None,
-                }
-                for i in range(n)
-            ]
-            world.data_collector.metadata["overtaking_group_world_time_events"] = []
-            if hasattr(world.data_collector, "_write_metadata"):
-                world.data_collector._write_metadata()
         hud.notification(f"分段采集开始: {phase_name}", seconds=1.8)
 
     def _stop_segment_recording():
@@ -327,33 +336,6 @@ def main():
         saved_path = world.data_collector.stop(world_end_time_s=sim_time)
         if saved_path:
             print(f"[前置熟悉实验] 分段保存完成: {saved_path}")
-
-    def _mark_overtake_group_world_time(group_idx: int, edge: str, sim_time: Optional[float]):
-        if (
-            world is None
-            or world.data_collector is None
-            or (not world.data_collector.is_collecting)
-            or getattr(world.data_collector, "metadata", None) is None
-            or group_idx < 0
-            or group_idx >= len(overtake_speeds_kmh)
-        ):
-            return
-        md = world.data_collector.metadata
-        groups = md.get("overtaking_group_world_time")
-        if not isinstance(groups, list) or len(groups) != len(overtake_speeds_kmh):
-            return
-        key = "start_world_time_s" if edge == "start" else "end_world_time_s"
-        groups[group_idx][key] = float(sim_time) if sim_time is not None else None
-        md.setdefault("overtaking_group_world_time_events", []).append(
-            {
-                "group_index": group_idx + 1,
-                "edge": edge,
-                "world_time_s": float(sim_time) if sim_time is not None else None,
-                "wall_time": datetime.now().isoformat(timespec="milliseconds"),
-            }
-        )
-        if hasattr(world.data_collector, "_write_metadata"):
-            world.data_collector._write_metadata()
 
     def _clamp(v: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, v))
@@ -447,23 +429,47 @@ def main():
         )
         world.lead_controller.start()
 
-    # 初始化阶段（阶段开始前先暂停 + 清理）
-    # 清理阶段开始前残留的“左边车辆”等
-    keep_ids = set()
-    if world.player is not None:
-        keep_ids.add(world.player.id)
-    if world.lead_vehicle is not None:
-        keep_ids.add(world.lead_vehicle.id)
-    cleanup_other_vehicles(keep_ids=keep_ids)
-
-    phase_type, phase_text, exp_type_str, base_speed_ms = phases[phase_idx][0], phases[phase_idx][1], phases[phase_idx][2], phases[phase_idx][3]
-    reset_lead_for_phase(exp_type_str, base_speed_ms)
-
     clock = pygame.time.Clock()
 
-    pause_remaining_s = float(args.pre_start_pause_s)
-    pause_end_wall = time.time() + pause_remaining_s
-    phase_start_wall = None  # 真正实验开始时刻（暂停结束后）
+    pause_end_wall = time.time() + float(args.pre_start_pause_s)
+    phase_start_wall = None
+
+    def reset_ego_lead_to_zero():
+        if world.lead_vehicle is not None:
+            world.lead_vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        if world.player is not None:
+            world.player.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+            world.player.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
+
+    def switch_phase(new_phase_idx: int):
+        nonlocal phase_idx, pause_end_wall, phase_start_wall
+        nonlocal overtake_phase_start_wall, overtake_cooldown_start_wall, overtake_prompt_pending, overtake_speed_reached
+        _stop_segment_recording()
+        phase_record_started["following"] = False
+        phase_record_started["overtaking"] = False
+
+        phase_idx = new_phase_idx % len(phases)
+        _, phase_text, exp_type_str, base_speed_ms = phases[phase_idx]
+
+        hard_restart_world()
+        reset_lead_for_phase(exp_type_str, base_speed_ms)
+        reset_ego_lead_to_zero()
+
+        phase_start_wall = None
+        overtake_phase_start_wall = None
+        overtake_prompt_pending = False
+        overtake_speed_reached = False
+        if phases[phase_idx][0] == "overtaking":
+            overtake_cooldown_start_wall = time.time()
+            pause_end_wall = 0.0
+        else:
+            overtake_cooldown_start_wall = None
+            pause_end_wall = time.time() + float(args.pre_start_pause_s)
+
+        hud.notification(f"切换到: {phase_text}（F4 / F11 / Insert 手动切换）", seconds=1.8)
+
+    # 初始化第一阶段
+    switch_phase(phase_idx)
 
     try:
         while running:
@@ -476,21 +482,53 @@ def main():
             clock.tick_busy_loop(30)
 
             # 事件 + 自车控制
-            # 注意：暂停期间我们会覆盖自车控制为 0，避免被试误触导致移动
             now_wall = time.time()
-            phase_pause_active = now_wall < pause_end_wall
+
+            def _recompute_phase_flags():
+                name = phases[phase_idx][0]
+                pause_fa = (name == "following") and (time.time() < pause_end_wall)
+                cool_oa = (
+                    name == "overtaking"
+                    and overtake_cooldown_start_wall is not None
+                    and (time.time() - overtake_cooldown_start_wall) < float(args.overtake_cooldown_s)
+                )
+                return name, pause_fa, cool_oa, (pause_fa or cool_oa)
+
+            current_phase_name, following_pause_active, overtaking_cooldown_active, phase_pause_active = _recompute_phase_flags()
+
+            SWITCH_KEYS = (pygame.K_F4, pygame.K_F11, pygame.K_INSERT, pygame.K_F12)
+            phase_switch_requested = False
+            try:
+                pending_keydowns = pygame.event.get(pygame.KEYDOWN)
+            except Exception:
+                pending_keydowns = []
+            for _ev in pending_keydowns:
+                if _ev.key == pygame.K_ESCAPE:
+                    running = False
+                elif _ev.key in SWITCH_KEYS:
+                    phase_switch_requested = True
+                else:
+                    try:
+                        pygame.event.post(_ev)
+                    except Exception:
+                        pass
+            if phase_switch_requested:
+                switch_phase(phase_idx + 1)
+                now_wall = time.time()
+                current_phase_name, following_pause_active, overtaking_cooldown_active, phase_pause_active = _recompute_phase_flags()
+
+            if not running:
+                break
 
             if args.input_mode == "keyboard":
-                # 仅保留退出事件；控制量用 key.get_pressed 采样
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
-                        running = False
-                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                         running = False
                 if not running:
                     break
 
                 keys = pygame.key.get_pressed()
+
                 dt_ms = clock.get_time()
                 if dt_ms <= 0:
                     dt_ms = 33
@@ -526,7 +564,6 @@ def main():
 
             # 更新 lead controller（暂停期间不更新，让前车保持 0）
             sim_time = world.hud.simulation_time if hasattr(world.hud, "simulation_time") else None
-            current_phase_name = phases[phase_idx][0]
             # 跟驰段：阶段正式开始后即开始采集
             if (
                 current_phase_name == "following"
@@ -559,87 +596,45 @@ def main():
                 except Exception:
                     pass
 
-            # 超车阶段：总时长135s；4组速度各30s，组间冷却5s（4*30 + 3*5）
+            # 跟驰阶段：倒计时结束自动切换到超车
+            if (
+                current_phase_name == "following"
+                and (not phase_pause_active)
+                and (phase_start_wall is not None)
+                and (now_wall - phase_start_wall) >= float(args.phase_duration_s)
+            ):
+                hud.notification("跟驰阶段结束，自动切换到超车", seconds=2.0)
+                switch_phase(phase_idx + 1)
+                now_wall = time.time()
+                current_phase_name = phases[phase_idx][0]
+
+            # 超车阶段：重生后先冷却10s，达到目标速度后提示超车，单次最大120s
             if current_phase_name == "overtaking" and (not phase_pause_active) and (phase_start_wall is not None):
                 if overtake_phase_start_wall is None:
-                    overtake_phase_start_wall = phase_start_wall
-                    overtake_group_start_wall = None
-                    overtake_group_idx = 0
-                    overtake_in_cooldown = False
+                    overtake_phase_start_wall = now_wall
+                    overtake_prompt_pending = True
+                    show_center_prompt("请进行跟驰", seconds=1.5)
 
-                seg_s = float(args.overtake_segment_duration_s)
-                cool_s = float(args.overtake_cooldown_s)
-                n = len(overtake_speeds_kmh)
-                total_s = n * seg_s + max(0, n - 1) * cool_s
-                elapsed_total = now_wall - overtake_phase_start_wall
-
-                # 计算当前处于哪一段（第k组行驶 or 冷却）
-                k = 0
-                t = elapsed_total
-                in_cooldown = False
-                while k < n:
-                    if t < seg_s:
-                        in_cooldown = False
-                        break
-                    t -= seg_s
-                    if k == n - 1:
-                        in_cooldown = False
-                        break
-                    if t < cool_s:
-                        in_cooldown = True
-                        break
-                    t -= cool_s
-                    k += 1
-
-                overtake_group_idx = k
-                overtake_in_cooldown = in_cooldown
-
-                # 超车段：仅在前车速度非零后开始采集（避免记录超车前静止段）
-                if (
-                    (not overtake_in_cooldown)
-                    and (not phase_record_started["overtaking"])
-                    and world.lead_vehicle is not None
-                ):
+                if (not phase_record_started["overtaking"]) and world.lead_vehicle is not None:
                     lv0 = world.lead_vehicle.get_velocity()
                     lead_speed0 = math.sqrt(lv0.x * lv0.x + lv0.y * lv0.y + lv0.z * lv0.z)
                     if lead_speed0 > 0.2:
                         _start_segment_recording("overtaking")
                         phase_record_started["overtaking"] = True
+                if overtake_prompt_pending and world.lead_vehicle is not None:
+                    target_ms = kmh_to_ms(float(args.overtake_speed_kmh))
+                    lv = world.lead_vehicle.get_velocity()
+                    lead_speed = math.sqrt(lv.x * lv.x + lv.y * lv.y + lv.z * lv.z)
+                    if lead_speed >= max(0.0, target_ms * 0.95):
+                        overtake_prompt_pending = False
+                        overtake_speed_reached = True
+                        show_center_prompt("请进行超车", seconds=1.5)
 
-                # 记录超车四段（行驶段）开始/结束世界时间
-                if not overtake_in_cooldown:
-                    if overtake_active_group_idx != overtake_group_idx:
-                        if overtake_active_group_idx is not None:
-                            _mark_overtake_group_world_time(overtake_active_group_idx, "end", sim_time)
-                        overtake_active_group_idx = overtake_group_idx
-                        _mark_overtake_group_world_time(overtake_active_group_idx, "start", sim_time)
-                elif overtake_active_group_idx is not None:
-                    _mark_overtake_group_world_time(overtake_active_group_idx, "end", sim_time)
-                    overtake_active_group_idx = None
-
-                # 在每组“行驶段”开始时重启并设置该组速度（只触发一次）
-                if (not overtake_in_cooldown) and (overtake_group_start_wall is None or now_wall - overtake_group_start_wall < 0):
-                    # 不会走到这里；保底
-                    pass
-                if (not overtake_in_cooldown):
-                    # 检测是否刚进入新的行驶段：用一个阈值判断“t 接近 0”
-                    if t < 0.08 and overtake_group_start_wall != overtake_group_idx:
-                        hard_restart_world()
-                        reset_lead_for_phase("overtaking", kmh_to_ms(overtake_speeds_kmh[overtake_group_idx]))
-                        overtake_prompt_until_wall = 0.0
-                        overtake_speed_reached = False
-                        # 用一个小技巧：把 overtake_group_start_wall 复用成“已触发的组号”
-                        overtake_group_start_wall = overtake_group_idx
-                else:
-                    # 冷却：强制前车速度为0，并停用 controller
-                    world.lead_controller = None
-                    try:
-                        if world.lead_vehicle is not None:
-                            world.lead_vehicle.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
-                    except Exception:
-                        pass
-                    overtake_prompt_until_wall = 0.0
-                    overtake_speed_reached = False
+                if overtake_phase_start_wall is not None and (now_wall - overtake_phase_start_wall) >= float(args.overtake_max_duration_s):
+                    hud.notification("超车阶段已达 120s，自动切回跟驰", seconds=2.0)
+                    switch_phase(0)
+                    now_wall = time.time()
+                    current_phase_name = phases[phase_idx][0]
 
             # HUD 更新（不调用 World.tick，避免 lead_controller 在暂停期间被推进）
             world.hud.tick(world, clock)
@@ -648,105 +643,29 @@ def main():
             world.render(display)
 
             # 绘制阶段大字/倒计时（覆盖在渲染之上）
-            if phase_pause_active:
+            if following_pause_active:
                 remaining = pause_end_wall - now_wall
-                draw_big_message(display, font_large, "暂停中", remaining, args.width, args.height)
+                draw_center_countdown(display, font_large, f"倒计时: {fmt_mm_ss(remaining)}", args.width, args.height)
+            elif overtaking_cooldown_active:
+                reset_ego_lead_to_zero()
+                remaining = float(args.overtake_cooldown_s) - (now_wall - overtake_cooldown_start_wall)
+                draw_center_countdown(display, font_large, f"倒计时: {fmt_mm_ss(remaining)}", args.width, args.height)
             else:
                 if phase_start_wall is None:
                     phase_start_wall = now_wall
-                _, phase_text, _, _ = phases[phase_idx]
-                if phases[phase_idx][0] == "overtaking":
-                    # 超车阶段：显示总倒计时（135s）
-                    seg_s = float(args.overtake_segment_duration_s)
-                    cool_s = float(args.overtake_cooldown_s)
-                    n = len(overtake_speeds_kmh)
-                    total_s = n * seg_s + max(0, n - 1) * cool_s
-                    if overtake_phase_start_wall is None:
-                        remaining = total_s
-                    else:
-                        remaining = total_s - (now_wall - overtake_phase_start_wall)
-                    phase_text_draw = ""
-                    if overtake_in_cooldown:
-                        phase_text_draw = "请进行跟驰"
-                    elif 0 <= overtake_group_idx < len(overtake_speeds_kmh) and world.lead_vehicle is not None:
-                        target_ms = kmh_to_ms(overtake_speeds_kmh[overtake_group_idx])
-                        lv = world.lead_vehicle.get_velocity()
-                        lead_speed = math.sqrt(lv.x * lv.x + lv.y * lv.y + lv.z * lv.z)
-                        if (not overtake_speed_reached) and lead_speed >= max(0.0, target_ms * 0.95):
-                            overtake_speed_reached = True
-                            overtake_prompt_until_wall = now_wall + 1.5
-                        if now_wall < overtake_prompt_until_wall:
-                            phase_text_draw = "请进行超车"
-                        elif not overtake_speed_reached:
-                            phase_text_draw = "请进行跟驰"
-                    draw_big_message(display, font_large, phase_text_draw, remaining, args.width, args.height)
-                else:
+                    _, phase_text, _, _ = phases[phase_idx]
+                    show_center_prompt(phase_text, seconds=1.5)
+                if phases[phase_idx][0] == "following":
                     remaining = args.phase_duration_s - (now_wall - phase_start_wall)
-                    draw_big_message(display, font_large, phase_text, remaining, args.width, args.height)
+                    draw_top_right_countdown(display, font_small, f"倒计时: {fmt_mm_ss(remaining)}", args.width)
+                elif phases[phase_idx][0] == "overtaking":
+                    remaining = float(args.overtake_max_duration_s) - (now_wall - phase_start_wall)
+                    draw_top_right_countdown(display, font_small, f"倒计时: {fmt_mm_ss(remaining)}", args.width)
+            if center_prompt_text and now_wall < center_prompt_until_wall:
+                draw_center_message(display, font_large, center_prompt_text, args.width, args.height)
             pygame.display.flip()
 
-            # 计时与阶段切换
-            should_switch = False
-            if (not phase_pause_active) and phase_start_wall is not None:
-                if phases[phase_idx][0] == "overtaking":
-                    # 超车阶段按总时长结束（135s）
-                    seg_s = float(args.overtake_segment_duration_s)
-                    cool_s = float(args.overtake_cooldown_s)
-                    n = len(overtake_speeds_kmh)
-                    total_s = n * seg_s + max(0, n - 1) * cool_s
-                    if overtake_phase_start_wall is not None and (now_wall - overtake_phase_start_wall) >= total_s:
-                        should_switch = True
-                else:
-                    if (now_wall - phase_start_wall) >= args.phase_duration_s:
-                        should_switch = True
-
-            if should_switch:
-                if overtake_active_group_idx is not None:
-                    _mark_overtake_group_world_time(overtake_active_group_idx, "end", sim_time)
-                    overtake_active_group_idx = None
-                _stop_segment_recording()
-                # 切换阶段：清理残留车辆 + 重置前车行为 + 再次暂停15s
-                phase_idx = (phase_idx + 1) % len(phases)
-                phase_record_started["following"] = False
-                phase_record_started["overtaking"] = False
-
-                keep_ids = set()
-                if world.player is not None:
-                    keep_ids.add(world.player.id)
-                if world.lead_vehicle is not None:
-                    keep_ids.add(world.lead_vehicle.id)
-                cleanup_other_vehicles(keep_ids=keep_ids)
-
-                _, phase_text, exp_type_str, base_speed_ms = phases[phase_idx]
-                # 进入超车阶段时：初始化超车速度序列与定时器
-                if phases[phase_idx][0] == "overtaking":
-                    overtake_group_idx = 0
-                    overtake_in_cooldown = False
-                    overtake_group_start_wall = None
-                    overtake_phase_start_wall = None
-                    overtake_prompt_until_wall = 0.0
-                    overtake_speed_reached = False
-                    overtake_active_group_idx = None
-                    exp_type_str = "overtaking_groups"
-                    base_speed_ms = 0.0
-                else:
-                    overtake_group_idx = 0
-                    overtake_in_cooldown = False
-                    overtake_group_start_wall = None
-                    overtake_phase_start_wall = None
-                    overtake_prompt_until_wall = 0.0
-                    overtake_speed_reached = False
-                    overtake_active_group_idx = None
-                reset_lead_for_phase(exp_type_str, base_speed_ms)
-
-                phase_start_wall = None
-                pause_end_wall = time.time() + float(args.pre_start_pause_s)
-
     finally:
-        if world is not None and overtake_active_group_idx is not None:
-            sim_time = world.hud.simulation_time if hasattr(world.hud, "simulation_time") else None
-            _mark_overtake_group_world_time(overtake_active_group_idx, "end", sim_time)
-            overtake_active_group_idx = None
         if world is not None and world.data_collector and world.data_collector.is_collecting:
             sim_time = world.hud.simulation_time if hasattr(world.hud, "simulation_time") else None
             saved_path = world.data_collector.stop(world_end_time_s=sim_time)

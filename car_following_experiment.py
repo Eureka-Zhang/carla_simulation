@@ -819,6 +819,8 @@ class World:
         self._experiment_cooldown_active = False
         self._experiment_cooldown_start_sim_time = None
         self.cooldown_remaining_s = 0.0
+        self.experiment_remaining_s = 0.0
+        self.experiment_countdown_active = False
 
         # 自动采集：冷却结束后开始；切换实验/重启/退出时停止
         self._experiment_record_started = False
@@ -1559,14 +1561,25 @@ class World:
                         self.hud.center_instruction("请进行超车", seconds=1.5)
                         self._overtaking_prompt_pending = False
 
-        # 实验模式：冷却结束后开始计时（每 200s 自动切换到下一场景）
+        # 实验模式：冷却结束后开始计时（每 120s 自动切换到下一场景）
         if self._use_experiment_mode() and sim_time is not None:
             if not self._experiment_cooldown_active:
                 if self.experiment_start_sim_time is None:
                     self.experiment_start_sim_time = sim_time
-                elif sim_time - self.experiment_start_sim_time >= self.experiment_duration_s:
+                elapsed = sim_time - self.experiment_start_sim_time
+                self.experiment_remaining_s = max(0.0, self.experiment_duration_s - elapsed)
+                self.experiment_countdown_active = True
+                if elapsed >= self.experiment_duration_s:
+                    self.experiment_countdown_active = False
+                    self.experiment_remaining_s = 0.0
                     self.switch_to_next_experiment()
                     return
+            else:
+                self.experiment_remaining_s = 0.0
+                self.experiment_countdown_active = False
+        else:
+            self.experiment_remaining_s = 0.0
+            self.experiment_countdown_active = False
         
         # 直道保护（默认关闭，只在明确指定 --auto-reset 时启用）
         if getattr(self.args, 'auto_reset', False) and self.player:
@@ -2377,6 +2390,8 @@ class HUD:
         self._show_ackermann_info = False
         self._ackermann_control = carla.VehicleAckermannControl()
         self._cooldown_remaining_s = 0.0
+        self._experiment_remaining_s = 0.0
+        self._experiment_countdown_active = False
         self._center_instruction_text = ''
         self._center_instruction_seconds_left = 0.0
         self._center_overlay_color = (255, 255, 255)
@@ -2392,6 +2407,7 @@ class HUD:
             self._font_chinese = pygame.font.Font(chinese_font, 18)
             self._font_chinese_large = pygame.font.Font(chinese_font, 20)
             self._font_cooldown = pygame.font.Font(chinese_font, 64)
+            self._font_countdown_small = pygame.font.Font(chinese_font, 32)
         else:
             print("警告: 未找到中文字体，使用默认字体")
             font_name = 'courier' if os.name == 'nt' else 'mono'
@@ -2403,6 +2419,7 @@ class HUD:
             self._font_chinese = pygame.font.Font(pygame.font.get_default_font(), 18)
             self._font_chinese_large = pygame.font.Font(pygame.font.get_default_font(), 20)
             self._font_cooldown = pygame.font.Font(pygame.font.get_default_font(), 64)
+            self._font_countdown_small = pygame.font.Font(pygame.font.get_default_font(), 32)
         
     def on_world_tick(self, timestamp):
         self._server_clock.tick()
@@ -2419,6 +2436,8 @@ class HUD:
         if self._center_instruction_seconds_left <= 0.0:
             self._center_instruction_text = ''
         self._cooldown_remaining_s = float(getattr(world, 'cooldown_remaining_s', 0.0) or 0.0)
+        self._experiment_remaining_s = float(getattr(world, 'experiment_remaining_s', 0.0) or 0.0)
+        self._experiment_countdown_active = bool(getattr(world, 'experiment_countdown_active', False))
         if not self._show_info:
             return
             
@@ -2440,14 +2459,6 @@ class HUD:
             '制动: %14.2f' % c.brake,
             '方向: %14.2f' % c.steer,
         ]
-
-        if world._use_experiment_mode():
-            self._info_text.extend([
-                '',
-                '%s' % world._get_experiment_sidebar_title(),
-                '实验: %15s' % world._get_experiment_label(),
-                '按键: F4/F5~F10 切换并重启'
-            ])
 
         # 前车信息（仅显示速度和车头间距）
         if world.lead_vehicle:
@@ -2501,7 +2512,22 @@ class HUD:
         ty = (self.dim[1] - surface.get_height()) // 2
         display.blit(shadow, (tx + 3, ty + 3))
         display.blit(surface, (tx, ty))
-        
+
+    def _render_top_right_countdown(self, display, text):
+        surface = self._font_countdown_small.render(text, True, self._center_overlay_color)
+        shadow = self._font_countdown_small.render(text, True, self._center_overlay_shadow_color)
+        tx = max(12, self.dim[0] - surface.get_width() - 12)
+        ty = 12
+        display.blit(shadow, (tx + 2, ty + 2))
+        display.blit(surface, (tx, ty))
+
+    @staticmethod
+    def _fmt_mm_ss(seconds):
+        seconds = max(0.0, float(seconds))
+        mm = int(seconds // 60)
+        ss = int(seconds % 60)
+        return f"{mm:02d}:{ss:02d}"
+
     def render(self, display):
         if self._show_info:
             info_surface = pygame.Surface((250, self.dim[1]))
@@ -2516,12 +2542,14 @@ class HUD:
                     display.blit(surface, (8, v_offset))
                 v_offset += 18
         self._notifications.render(display)
-        # 屏幕中央大号显示每个实验开始前的冷却倒计时
+        # 冷却中：中央显示倒计时；否则在实验进行中右上角显示倒计时
         if self._cooldown_remaining_s > 0.0:
-            text = f"冷却: {self._cooldown_remaining_s:.0f}s"
-            self._render_center_overlay(display, text)
-        elif self._center_instruction_text and self._center_instruction_seconds_left > 0.0:
-            self._render_center_overlay(display, self._center_instruction_text)
+            self._render_center_overlay(display, f"倒计时: {self._fmt_mm_ss(self._cooldown_remaining_s)}")
+        else:
+            if self._center_instruction_text and self._center_instruction_seconds_left > 0.0:
+                self._render_center_overlay(display, self._center_instruction_text)
+            if self._experiment_countdown_active and self._experiment_remaining_s > 0.0:
+                self._render_top_right_countdown(display, f"倒计时: {self._fmt_mm_ss(self._experiment_remaining_s)}")
         self.help.render(display)
 
 
