@@ -466,7 +466,9 @@ def main():
             overtake_cooldown_start_wall = None
             pause_end_wall = time.time() + float(args.pre_start_pause_s)
 
-        hud.notification(f"切换到: {phase_text}（F4 / F11 / Insert 手动切换）", seconds=1.8)
+        phase_label_map = {"following": "前置实验-跟驰", "overtaking": "前置实验-超车"}
+        phase_label = phase_label_map.get(phases[phase_idx][0], phase_text)
+        hud.notification(phase_label, seconds=1.8)
 
     # 初始化第一阶段
     switch_phase(phase_idx)

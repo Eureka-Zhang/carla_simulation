@@ -2624,8 +2624,6 @@ class CollisionSensor:
         self = weak_self()
         if not self:
             return
-        actor_type = get_actor_display_name(event.other_actor)
-        self.hud.notification('碰撞: %r' % actor_type)
         impulse = event.normal_impulse
         intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
         self.history.append((event.frame, intensity))
@@ -3096,7 +3094,6 @@ def game_loop(args):
             print(f"驾驶舱回传打印: 每 {ce:.2f}s 一行（关闭: --cabin-echo-interval 0）")
         print()
         
-        hud.notification("按 F1 开始数据采集, H 显示帮助", seconds=5.0)
 
         # 主循环
         loop_count = 0
