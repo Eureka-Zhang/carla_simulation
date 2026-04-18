@@ -412,26 +412,34 @@ class LeadVehicleController:
             if not hasattr(self, '_speed_integral'):
                 self._speed_integral = 0.0
             self._speed_integral += speed_error * 0.05  # dt ≈ 0.05s
-            self._speed_integral = max(-5.0, min(5.0, self._speed_integral))  # 限幅
+            self._speed_integral = max(-10.0, min(10.0, self._speed_integral))  # 限幅
             
             # PI 控制
-            Kp = 0.3  # 比例增益
-            Ki = 0.05  # 积分增益
+            Kp = 0.5   # 比例增益
+            Ki = 0.08  # 积分增益
             control_signal = Kp * speed_error + Ki * self._speed_integral
             
-            if control_signal > 0.1:
-                # 需要加速
-                throttle = min(1.0, 0.4 + control_signal * 0.3)
+            # 速度显著低于目标（>1 m/s）时直接全油门，保证能到达 65km/h 等较高目标速度
+            if speed_error > 1.0:
+                throttle = 1.0
                 brake = 0.0
+            elif control_signal > 0.1:
+                # 需要加速
+                throttle = min(1.0, 0.5 + control_signal * 0.3)
+                brake = 0.0
+            elif speed_error < -1.0:
+                # 显著超过目标：主动刹车
+                throttle = 0.0
+                brake = min(1.0, (-speed_error) * 0.3)
             elif control_signal < -0.1:
                 # 需要减速
                 throttle = 0.0
                 brake = min(1.0, -control_signal * 0.2)
             else:
                 # 保持速度 - 根据目标速度计算维持油门
-                # 72 km/h ≈ 20 m/s 需要约 0.5 油门
-                maintain_throttle = 0.35 + (target_speed / 25.0) * 0.25
-                throttle = min(0.8, maintain_throttle)
+                # 65 km/h ≈ 18 m/s 需要约 0.55 油门；提高上限避免在高目标速度下被裁掉
+                maintain_throttle = 0.4 + (target_speed / 25.0) * 0.3
+                throttle = min(1.0, maintain_throttle)
                 brake = 0.0
             
             control = carla.VehicleControl(
