@@ -1,9 +1,10 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
-# 一键启动主视角 + 多相机视角（每个进程一个独立终端窗口）
+# 一键启动「超车实验」主视角 + 多相机视角（每个进程一个独立终端窗口）
+# 仅运行 overtaking 实验组（3 组不同速度的超车实验）
 # 用法：
-#   1) 在项目根目录执行：powershell -ExecutionPolicy Bypass -File .\launch_all_views.ps1
-#   2) 或直接右键“使用 PowerShell 运行”
+#   1) 在项目根目录执行：powershell -ExecutionPolicy Bypass -File .\launch_car_overtaking.ps1
+#   2) 或直接双击 launch_car_overtaking.bat
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $condaEnvName = "carla39"
@@ -19,8 +20,8 @@ $condaActivateBat = $condaActivateCandidates | Where-Object { Test-Path $_ } | S
 
 $jobs = @(
     @{
-        Title   = "CARLA Main View"
-        Command = "python .\car_following_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1920x1080 --cabin-echo-interval 0.25 --four-experiments"
+        Title   = "CARLA Overtaking Main View"
+        Command = "python .\car_following_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1920x1080 --cabin-echo-interval 0.25 --four-experiments --experiment-scope overtaking"
     },
     @{
         Title   = "CARLA Left Camera"
@@ -56,7 +57,7 @@ foreach ($job in $jobs) {
 }
 
 if ($condaActivateBat) {
-    Write-Host "已启动全部视角终端窗口（已配置 conda activate $condaEnvName）。" -ForegroundColor Green
+    Write-Host "已启动「超车实验」全部视角终端窗口（已配置 conda activate $condaEnvName）。" -ForegroundColor Green
 } else {
-    Write-Host "已启动全部视角终端窗口。未找到 activate.bat，将依赖 conda 命令可用性。" -ForegroundColor Yellow
+    Write-Host "已启动「超车实验」全部视角终端窗口。未找到 activate.bat，将依赖 conda 命令可用性。" -ForegroundColor Yellow
 }

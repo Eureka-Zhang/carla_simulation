@@ -36,11 +36,11 @@ $jobs = @(
     },
     @{
         Title   = "CARLA LeftBack Camera"
-        Command = "python .\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 900 --pos-y 700"
+        Command = "python .\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 975 --pos-y 700"
     },
     @{
         Title   = "CARLA RightBack Camera"
-        Command = "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 1050 --pos-y 760"
+        Command = "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 975 --pos-y 760"
     }
 )
 

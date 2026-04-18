@@ -6,7 +6,7 @@
 两个阶段手动切换键：F4（与主脚本一致）、F11、Insert、F12。
 按键拦截在 parse_events 之前，避免 cabin 模式下被主脚本的 F4 处理吞掉。
 1) 跟驰：按设定节奏进行不规则变速
-2) 超车：每次进入阶段都会重生车辆并置零速度，冷却10s后前车加速，达到目标速后提示“请进行超车”
+2) 超车：每次进入阶段都会重生车辆并置零速度，冷却10s后提示“先进行跟驰 / 随后变道超车”
 
 超车阶段最大时长 120s，超时后自动切回跟驰。
 """
@@ -40,7 +40,8 @@ def draw_center_message(display, font_large, text: str, width: int, height: int)
 
     lines = []
     if text:
-        lines.append(str(text))
+        for part in str(text).splitlines():
+            lines.append(part)
     if not lines:
         return
 
@@ -287,7 +288,7 @@ def main():
     # 阶段配置
     phases = [
         ("following", "请进行跟驰", "following_irregular", kmh_to_ms(args.follow_speed_kmh)),
-        ("overtaking", "请进行跟驰", "overtaking", kmh_to_ms(args.overtake_speed_kmh)),
+        ("overtaking", "先进行跟驰\n随后变道超车", "overtaking", kmh_to_ms(args.overtake_speed_kmh)),
     ]
 
     running = True
@@ -615,7 +616,7 @@ def main():
                 if overtake_phase_start_wall is None:
                     overtake_phase_start_wall = now_wall
                     overtake_prompt_pending = True
-                    show_center_prompt("请进行跟驰", seconds=1.5)
+                    # 初始提示由下面「phase_start_wall is None」分支统一触发，这里不再重复
 
                 if (not phase_record_started["overtaking"]) and world.lead_vehicle is not None:
                     lv0 = world.lead_vehicle.get_velocity()
@@ -630,7 +631,7 @@ def main():
                     if lead_speed >= max(0.0, target_ms * 0.95):
                         overtake_prompt_pending = False
                         overtake_speed_reached = True
-                        show_center_prompt("请进行超车", seconds=1.5)
+                        show_center_prompt("可超车", seconds=1.5)
 
                 if overtake_phase_start_wall is not None and (now_wall - overtake_phase_start_wall) >= float(args.overtake_max_duration_s):
                     hud.notification("超车阶段已达 120s，自动切回跟驰", seconds=2.0)

@@ -47,8 +47,8 @@ Phase 3: 被试作为乘客体验自动驾驶
     F1          : 开始/停止数据采集
     F2          : 切换驾驶模式 (手动/自动)
     F3          : 切换前车行为 (恒速/变速, 仅跟驰实验)
-    F4          : 切换到下一个实验并重启 (共6组)
-    F5-F10      : 直接切换实验 1-6 并重启
+    F4          : 切换到下一个实验并重启 (共4组)
+    F5-F10      : 直接切换实验 1-4 并重启
     TAB         : 切换相机视角
     C           : 切换天气
     V           : 切换地图层
@@ -126,10 +126,8 @@ DEFAULT_LEAD_SPEED = 20.0  # m/s
 MIN_SPACING = 5.0  # 最小间距
 SAFE_TIME_HEADWAY = 1.5  # 安全时距
 
-# 6组实验：3组跟驰策略 + 3组超车速度阶段
+# 实验组：跟驰仅保留 irregular + 3组超车速度阶段
 FOLLOWING_EXPERIMENT_TYPES = (
-    'following_smooth',
-    'following_aggressive',
     'following_irregular',
 )
 OVERTAKING_SPEEDS_KMH = (35.0, 50.0, 65.0)
@@ -200,7 +198,7 @@ class LeadVehicleController:
     
     def __init__(self, lead_vehicle, base_speed=DEFAULT_LEAD_SPEED,
                  random_mode=False, random_seed=None, follow_road=True,
-                 experiment_type='following_smooth'):
+                 experiment_type='following_irregular'):
         self.vehicle = lead_vehicle
         self.base_speed = base_speed
         self.current_target_speed = base_speed
@@ -798,19 +796,27 @@ class World:
         # 数据采集
         self.data_collector = DataCollector()
 
-        # 6组实验管理：1-3 跟驰策略, 4-6 超车(35/50/65 km/h)
+        # 实验管理：可按 scope 拆分为仅跟驰 / 仅超车 / 全部
+        self.experiment_scope = getattr(args, 'experiment_scope', 'all')
         self.experiment_plan = []
-        for exp_type in FOLLOWING_EXPERIMENT_TYPES:
-            self.experiment_plan.append({
-                'type': exp_type,
-            })
-        for speed_kmh in OVERTAKING_SPEEDS_KMH:
-            self.experiment_plan.append({
-                'type': 'overtaking',
-                'speed_kmh': speed_kmh,
-            })
+        if self.experiment_scope in ('all', 'following'):
+            for exp_type in FOLLOWING_EXPERIMENT_TYPES:
+                self.experiment_plan.append({
+                    'type': exp_type,
+                })
+        if self.experiment_scope in ('all', 'overtaking'):
+            for speed_kmh in OVERTAKING_SPEEDS_KMH:
+                self.experiment_plan.append({
+                    'type': 'overtaking',
+                    'speed_kmh': speed_kmh,
+                })
+        if not self.experiment_plan:
+            # 兜底：至少保留一个跟驰实验，避免空计划导致索引错误
+            self.experiment_plan = [{'type': 'following_irregular'}]
         self.experiment_index = 0
-        self.experiment_duration_s = 120.0
+        # 实验时长：跟驰默认 180s，超车默认 120s
+        self.following_experiment_duration_s = float(getattr(args, 'following_experiment_duration_s', 180.0))
+        self.overtaking_experiment_duration_s = float(getattr(args, 'overtaking_experiment_duration_s', 120.0))
         self.experiment_start_sim_time = None
 
         # 每个实验开始前的冷却时间：用于先打开窗口/录制，再开始让前车起步
@@ -824,7 +830,7 @@ class World:
 
         # 自动采集：冷却结束后开始；切换实验/重启/退出时停止
         self._experiment_record_started = False
-        # 超车实验提示流程：先“请进行跟驰”，达到目标速后“请进行超车”
+        # 超车实验提示流程：开始提示“先进行跟驰/随后变道超车”
         self._overtaking_prompt_pending = False
         
         # 配置
@@ -872,22 +878,35 @@ class World:
         exp = self._get_current_experiment()
         if not exp:
             return "默认实验"
-        if exp['type'] == 'following_smooth':
-            return f"实验{self.experiment_index + 1}/6 跟驰-缓加缓减"
-        if exp['type'] == 'following_aggressive':
-            return f"实验{self.experiment_index + 1}/6 跟驰-急加急减"
+        total = len(self.experiment_plan)
+        following_idx = sum(
+            1 for i in range(self.experiment_index + 1)
+            if self.experiment_plan[i]['type'].startswith('following_')
+        )
+        overtaking_idx = sum(
+            1 for i in range(self.experiment_index + 1)
+            if self.experiment_plan[i]['type'] == 'overtaking'
+        )
         if exp['type'] == 'following_irregular':
-            return f"实验{self.experiment_index + 1}/6 跟驰-不规则变速"
-        return f"实验{self.experiment_index + 1}/6 超车 {exp['speed_kmh']:.0f}km/h"
+            return f"实验{self.experiment_index + 1}/{total} 跟驰-不规则变速"
+        return f"实验{self.experiment_index + 1}/{total} 超车{int(overtaking_idx)} {exp['speed_kmh']:.0f}km/h"
 
     def _get_experiment_sidebar_title(self):
-        """侧边栏实验组标题：跟驰实验1~3、超车实验1~3（与 experiment_index 0~5 对应）。"""
+        """侧边栏实验组标题：按当前 experiment_scope 动态编号。"""
         exp = self._get_current_experiment()
         if not exp:
             return ""
         if exp['type'].startswith('following_'):
-            return f"跟驰实验{self.experiment_index + 1}"
-        return f"超车实验{self.experiment_index - 2}"
+            idx = sum(
+                1 for i in range(self.experiment_index + 1)
+                if self.experiment_plan[i]['type'].startswith('following_')
+            )
+            return f"跟驰实验{idx}"
+        idx = sum(
+            1 for i in range(self.experiment_index + 1)
+            if self.experiment_plan[i]['type'] == 'overtaking'
+        )
+        return f"超车实验{idx}"
 
     def _get_effective_lead_speed(self):
         exp = self._get_current_experiment()
@@ -901,7 +920,13 @@ class World:
         exp = self._get_current_experiment()
         if exp:
             return exp['type']
-        return 'following_smooth'
+        return 'following_irregular'
+
+    def _get_effective_experiment_duration_s(self):
+        exp = self._get_current_experiment()
+        if exp and exp['type'].startswith('following_'):
+            return self.following_experiment_duration_s
+        return self.overtaking_experiment_duration_s
 
     def _get_effective_lead_distance(self):
         base_dist = getattr(self.args, 'lead_distance', 50.0)
@@ -1005,7 +1030,7 @@ class World:
 
     def switch_to_experiment(self, index):
         if not self._use_experiment_mode():
-            self.hud.notification("未启用6组实验模式", seconds=2.0)
+            self.hud.notification("未启用实验模式", seconds=2.0)
             return
         # 切换实验前强制停止数据采集，保证每个实验独立文件
         if self.data_collector and self.data_collector.is_collecting:
@@ -1019,7 +1044,7 @@ class World:
 
     def switch_to_next_experiment(self):
         if not self._use_experiment_mode():
-            self.hud.notification("未启用6组实验模式", seconds=2.0)
+            self.hud.notification("未启用实验模式", seconds=2.0)
             return
         # 切换实验前强制停止数据采集，保证每个实验独立文件
         if self.data_collector and self.data_collector.is_collecting:
@@ -1282,7 +1307,7 @@ class World:
             self.world.tick()  # 多等一帧确保物理稳定
         
         # 设置两车初速度
-        # 6组实验中前车统一从 0 起步，再按策略加速；cabin 下自车也从 0 起步
+        # 4组实验中前车统一从 0 起步，再按策略加速；cabin 下自车也从 0 起步
         if getattr(self.args, 'input_mode', 'keyboard') == 'cabin':
             initial_speed = 0.0
         else:
@@ -1532,7 +1557,10 @@ class World:
                         self.cooldown_remaining_s = 0.0
                         exp = self._get_current_experiment() if self._use_experiment_mode() else None
                         if exp:
-                            self.hud.center_instruction("请进行跟驰", seconds=1.5)
+                            if exp.get('type') == 'overtaking':
+                                self.hud.center_instruction("先进行跟驰\n随后变道超车", seconds=1.5)
+                            else:
+                                self.hud.center_instruction("请进行跟驰", seconds=1.5)
                             self._overtaking_prompt_pending = (exp.get('type') == 'overtaking')
                         # 倒计时结束：自动开始数据采集（每个实验独立文件）
                         if not self._experiment_record_started and self.lead_controller:
@@ -1556,20 +1584,21 @@ class World:
                     lead_vel = self.lead_vehicle.get_velocity()
                     lead_speed = math.sqrt(lead_vel.x**2 + lead_vel.y**2 + lead_vel.z**2)
                     target_speed = self._get_effective_lead_speed()
-                    # 达到目标速度（允许小幅容差）后提示进入超车阶段
+                    # 达到目标速度（允许小幅容差）后结束等待状态，并提示可超车
                     if lead_speed >= max(0.0, target_speed * 0.95):
-                        self.hud.center_instruction("请进行超车", seconds=1.5)
                         self._overtaking_prompt_pending = False
+                        self.hud.center_instruction("可超车", seconds=1.5)
 
-        # 实验模式：冷却结束后开始计时（每 120s 自动切换到下一场景）
+        # 实验模式：冷却结束后开始计时（跟驰默认 180s，超车默认 120s）
         if self._use_experiment_mode() and sim_time is not None:
             if not self._experiment_cooldown_active:
                 if self.experiment_start_sim_time is None:
                     self.experiment_start_sim_time = sim_time
                 elapsed = sim_time - self.experiment_start_sim_time
-                self.experiment_remaining_s = max(0.0, self.experiment_duration_s - elapsed)
+                current_duration = self._get_effective_experiment_duration_s()
+                self.experiment_remaining_s = max(0.0, current_duration - elapsed)
                 self.experiment_countdown_active = True
-                if elapsed >= self.experiment_duration_s:
+                if elapsed >= current_duration:
                     self.experiment_countdown_active = False
                     self.experiment_remaining_s = 0.0
                     self.switch_to_next_experiment()
@@ -1725,6 +1754,8 @@ class VehicleController:
         self._last_cabin_apply_echo_time = 0.0
         self._cabin_stuck_since = None
         self._last_cabin_nudge_time = 0.0
+        # 发送给 SCANeR 的阻力反馈输出（上一帧稳定值）
+        self._ffb_output = 0.0
         
         if self.input_mode == 'cabin':
             self._setup_cabin_connection()
@@ -1779,7 +1810,7 @@ class VehicleController:
                 # F1: 开始/停止数据采集
                 elif event.key == K_F1:
                     if world._use_experiment_mode():
-                        world.hud.notification("6组实验模式：采集由冷却倒计时自动控制，F1 无效", seconds=2.0)
+                        world.hud.notification("4组实验模式：采集由冷却倒计时自动控制，F1 无效", seconds=2.0)
                     else:
                         if world.data_collector.is_collecting:
                             sim_time = world.hud.simulation_time if hasattr(world.hud, 'simulation_time') else None
@@ -1811,23 +1842,28 @@ class VehicleController:
                         mode = world.lead_controller.toggle_mode()
                         world.hud.notification(f"前车行为: {mode}")
 
-                # F4: 切换下一个实验 (共6组)，并重启
+                # F4: 切换下一个实验（按当前实验计划）
                 elif event.key == K_F4:
                     world.switch_to_next_experiment()
 
-                # F5-F10: 直接切换实验 1-6，并重启
-                elif event.key == K_F5:
-                    world.switch_to_experiment(0)
-                elif event.key == K_F6:
-                    world.switch_to_experiment(1)
-                elif event.key == K_F7:
-                    world.switch_to_experiment(2)
-                elif event.key == K_F8:
-                    world.switch_to_experiment(3)
-                elif event.key == K_F9:
-                    world.switch_to_experiment(4)
-                elif event.key == K_F10:
-                    world.switch_to_experiment(5)
+                # F5-F10: 直接切换实验 1-4（若当前计划不足，超出的按键给提示）
+                elif event.key in (K_F5, K_F6, K_F7, K_F8, K_F9, K_F10):
+                    key_to_index = {
+                        K_F5: 0,
+                        K_F6: 1,
+                        K_F7: 2,
+                        K_F8: 3,
+                        K_F9: 4,
+                        K_F10: 5,
+                    }
+                    target_idx = key_to_index[event.key]
+                    if target_idx < len(world.experiment_plan):
+                        world.switch_to_experiment(target_idx)
+                    else:
+                        world.hud.notification(
+                            f"当前模式仅有 {len(world.experiment_plan)} 组实验",
+                            seconds=1.8
+                        )
                         
                 # Tab: 切换相机
                 elif event.key == K_TAB:
@@ -2152,20 +2188,24 @@ class VehicleController:
             v = world.player.get_velocity()
             c = world.player.get_control()
             speed = 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
+            if not math.isfinite(speed):
+                speed = 0.0
             
             # 计算发动机转速（模拟）
-            engine_rpm = 0
+            engine_rpm = 0.0
             if self._physics_control and c.gear > 0:
                 gear = self._physics_control.forward_gears[min(c.gear, len(self._physics_control.forward_gears)-1)]
                 engine_rpm = speed * gear.ratio * 100  # 简化计算
+            if not math.isfinite(engine_rpm):
+                engine_rpm = 0.0
                 
-            # 力反馈值
-            fValue1 = 0
+            # 发送上一帧反馈值，避免在同一帧“先发后算”导致的不稳定
+            fValue1_send = float(self._ffb_output) if math.isfinite(self._ffb_output) else 0.0
             
             # 发送数据到驾驶舱
             data_send = struct.pack(
                 '<Lffffffffffffffff', 
-                15, engine_rpm, speed, fValue1, 
+                15, engine_rpm, speed, fValue1_send,
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             )
             
@@ -2232,7 +2272,12 @@ class VehicleController:
                     DEADZONE = 0.1
                     if abs(data[4]) < DEADZONE:
                         fValue1 = 0
+                    if not math.isfinite(fValue1):
+                        fValue1 = 0.0
+                    self._ffb_output = float(fValue1)
                     self._previous_steer_angle = -data[4] / 3
+                else:
+                    self._ffb_output = 0.0
                     
                 # 手刹
                 if data[5] > 0:
@@ -2451,7 +2496,6 @@ class HUD:
             'Server: %16.0f FPS' % self.server_fps,
             'Client: %16.0f FPS' % clock.get_fps(),
             '',
-            '速度: %15.0f km/h' % speed,
             '位置: (%5.1f, %5.1f)' % (t.location.x, t.location.y),
             '挡位: %15s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear),
             '',
@@ -2460,7 +2504,7 @@ class HUD:
             '方向: %14.2f' % c.steer,
         ]
 
-        # 前车信息（仅显示速度和车头间距）
+        # 行车信息（自车速度 / 前车速度 / 车头间距）
         if world.lead_vehicle:
             lead_loc = world.lead_vehicle.get_location()
             lead_vel = world.lead_vehicle.get_velocity()
@@ -2473,9 +2517,16 @@ class HUD:
 
             self._info_text.extend([
                 '',
-                '--- 跟驰信息 ---',
+                '--- 行车信息 ---',
+                '自车速度: %9.0f km/h' % speed,
                 '前车速度: %9.0f km/h' % lead_speed,
                 '车头间距: %9.1f m' % distance,
+            ])
+        else:
+            self._info_text.extend([
+                '',
+                '--- 行车信息 ---',
+                '自车速度: %9.0f km/h' % speed,
             ])
         
         # 数据采集状态
@@ -2506,12 +2557,24 @@ class HUD:
         self._center_instruction_seconds_left = max(0.0, float(seconds))
 
     def _render_center_overlay(self, display, text):
-        surface = self._font_cooldown.render(text, True, self._center_overlay_color)
-        shadow = self._font_cooldown.render(text, True, self._center_overlay_shadow_color)
-        tx = (self.dim[0] - surface.get_width()) // 2
-        ty = (self.dim[1] - surface.get_height()) // 2
-        display.blit(shadow, (tx + 3, ty + 3))
-        display.blit(surface, (tx, ty))
+        lines = [part for part in str(text).splitlines() if part != ""]
+        if not lines:
+            return
+        rendered = [
+            (
+                self._font_cooldown.render(line, True, self._center_overlay_color),
+                self._font_cooldown.render(line, True, self._center_overlay_shadow_color),
+            )
+            for line in lines
+        ]
+        line_gap = 10
+        total_h = sum(s.get_height() for s, _ in rendered) + line_gap * max(0, len(rendered) - 1)
+        ty = (self.dim[1] - total_h) // 2
+        for surface, shadow in rendered:
+            tx = (self.dim[0] - surface.get_width()) // 2
+            display.blit(shadow, (tx + 3, ty + 3))
+            display.blit(surface, (tx, ty))
+            ty += surface.get_height() + line_gap
 
     def _render_top_right_countdown(self, display, text):
         surface = self._font_countdown_small.render(text, True, self._center_overlay_color)
@@ -3066,8 +3129,8 @@ def game_loop(args):
         print("  F1        : 开始/停止数据采集")
         print("  F2        : 切换手动/跟驰自动驾驶")
         print("  F3        : 切换前车行为(恒速/变速, 仅跟驰实验)")
-        print("  F4        : 切换下一实验(1~6)并重启")
-        print("  F5~F10    : 直接切换实验1~6并重启")
+        print("  F4        : 切换下一实验并重启")
+        print("  F5~F10    : 直接切换实验1~6并重启(不足6组时按键会提示)")
         print("  TAB       : 切换相机视角")
         print("  C         : 切换天气      V        : 切换地图层")
         print("  R         : 录制图像      Ctrl+R   : 录制仿真")
@@ -3082,7 +3145,13 @@ def game_loop(args):
         ls_ms = args.lead_speed
         print(f"前车基准速度(--lead-speed): {ls_ms:.2f} m/s ({ls_ms * 3.6:.1f} km/h)")
         if args.enable_experiment_mode:
-            print("实验计划: 1-3 跟驰(缓变/急变/不规则) + 4-6 超车(35/50/65 km/h), 每次重启跑完整6km")
+            if args.experiment_scope == 'following':
+                print("实验计划: 仅跟驰(不规则变速) 共1组，每次重启跑完整6km")
+            elif args.experiment_scope == 'overtaking':
+                print("实验计划: 仅超车(35/50/65 km/h) 共3组，每次重启跑完整6km")
+            else:
+                print("实验计划: 1组跟驰(不规则变速) + 3组超车(35/50/65 km/h)")
+            print(f"实验时长: 跟驰 {args.following_experiment_duration_s:.0f}s, 超车 {args.overtaking_experiment_duration_s:.0f}s")
             print(f"当前实验: {world._get_experiment_label()}")
             eff = world._get_effective_lead_speed()
             print(
@@ -3188,14 +3257,22 @@ def main():
                           help='前车初始距离 (米)，默认50m')
     argparser.add_argument('--spawn-right-offset', default=2.5, type=float,
                           help='自车/前车生成点向右平移(米)，例如 3.5 表示右移一个车道宽')
-    argparser.add_argument('--six-experiments', action='store_true',
-                          help='启用6组实验切换(1-3跟驰缓变/急变/不规则, 4-6超车35/50/65 km/h)')
+    argparser.add_argument('--four-experiments', dest='four_experiments', action='store_true',
+                          help='启用4组实验切换(1组跟驰不规则 + 3组超车35/50/65 km/h)')
+    # 兼容旧参数名（内部统一使用 four_experiments）
+    argparser.add_argument('--six-experiments', dest='four_experiments', action='store_true', help=argparse.SUPPRESS)
+    argparser.add_argument('--experiment-scope', default='all', choices=['all', 'following', 'overtaking'],
+                          help='实验范围：all=跟驰+超车，following=仅跟驰，overtaking=仅超车')
+    argparser.add_argument('--following-experiment-duration-s', default=180.0, type=float,
+                          help='跟驰实验时长（秒），默认180')
+    argparser.add_argument('--overtaking-experiment-duration-s', default=120.0, type=float,
+                          help='超车实验时长（秒），默认120')
     argparser.add_argument('--experiment-cooldown-s', default=10.0, type=float,
-                          help='6组实验中：每次实验开始前冷却时间(秒)，冷却期前车速度保持0（默认10）')
+                          help='4组实验中：每次实验开始前冷却时间(秒)，冷却期前车速度保持0（默认10）')
     argparser.add_argument('--experiment-start-x', default=EXPERIMENT_START_X, type=float,
-                          help='6组实验重启时的起点X坐标')
+                          help='4组实验重启时的起点X坐标')
     argparser.add_argument('--experiment-start-y', default=EXPERIMENT_START_Y, type=float,
-                          help='6组实验重启时的起点Y坐标')
+                          help='4组实验重启时的起点Y坐标')
     
     # 模式设置
     argparser.add_argument('--sync', action='store_true', default=True, help='启用同步模式')
@@ -3225,8 +3302,8 @@ def main():
     else:
         args.input_mode = 'keyboard'
 
-    # 直道实验默认启用；也可显式 --six-experiments 开启
-    args.enable_experiment_mode = args.six_experiments or args.straight_road or bool(args.opendrive)
+    # 直道实验默认启用；也可显式 --four-experiments 开启
+    args.enable_experiment_mode = args.four_experiments or args.straight_road or bool(args.opendrive)
     
     if args.cabin_echo_interval is None:
         args.cabin_echo_interval = 0.25 if args.input_mode == 'cabin' else 0.0
