@@ -929,9 +929,9 @@ class World:
         return self.overtaking_experiment_duration_s
 
     def _get_effective_lead_distance(self):
-        base_dist = getattr(self.args, 'lead_distance', 50.0)
+        base_dist = getattr(self.args, 'lead_distance', 75.0)
         if self._get_effective_experiment_type() == 'overtaking':
-            return max(base_dist, 65.0)
+            return max(base_dist, 75.0)
         return base_dist
 
     def _get_experiment_start_spawn(self):
@@ -3253,8 +3253,8 @@ def main():
                           help='生成点索引 (Town04高速直道推荐: 1, 33, 65, 97)')
     argparser.add_argument('--list-spawns', action='store_true', 
                           help='列出所有生成点后退出')
-    argparser.add_argument('--lead-distance', default=50.0, type=float,
-                          help='前车初始距离 (米)，默认50m')
+    argparser.add_argument('--lead-distance', default=75.0, type=float,
+                          help='前车初始距离 (米)，默认75m')
     argparser.add_argument('--spawn-right-offset', default=2.5, type=float,
                           help='自车/前车生成点向右平移(米)，例如 3.5 表示右移一个车道宽')
     argparser.add_argument('--four-experiments', dest='four_experiments', action='store_true',

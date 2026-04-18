@@ -18,46 +18,20 @@ $condaActivateCandidates = @(
 )
 $condaActivateBat = $condaActivateCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-$jobs = @(
-    @{
-        Title   = "CARLA Following Main View"
-        Command = "python .\car_following_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1920x1080 --cabin-echo-interval 0.25 --four-experiments --experiment-scope following"
-    },
-    @{
-        Title   = "CARLA Left Camera"
-        Command = "python .\cameras\Left.py --host 127.0.0.1 --port 2000 --display 1"
-    },
-    @{
-        Title   = "CARLA Right Camera"
-        Command = "python .\cameras\Right.py --host 127.0.0.1 --port 2000 --display 3"
-    },
-    @{
-        Title   = "CARLA Back Camera"
-        Command = "python .\cameras\Back.py --host 127.0.0.1 --port 2000 --display 1 --pos-x 832 --pos-y 20"
-    },
-    @{
-        Title   = "CARLA LeftBack Camera"
-        Command = "python .\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 975 --pos-y 700"
-    },
-    @{
-        Title   = "CARLA RightBack Camera"
-        Command = "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 975 --pos-y 760"
-    }
-)
-
-foreach ($job in $jobs) {
+function Start-ViewTerminal($title, $command) {
     if ($condaActivateBat) {
-        $cmdLine = "title $($job.Title) && cd /d `"$projectRoot`" && call `"$condaActivateBat`" $condaEnvName && $($job.Command)"
+        $cmdLine = "title $title && cd /d `"$projectRoot`" && call `"$condaActivateBat`" $condaEnvName && $command"
     } else {
-        $cmdLine = "title $($job.Title) && cd /d `"$projectRoot`" && conda activate $condaEnvName && $($job.Command)"
+        $cmdLine = "title $title && cd /d `"$projectRoot`" && conda activate $condaEnvName && $command"
     }
-
     Start-Process -FilePath "cmd.exe" -ArgumentList @("/k", $cmdLine) | Out-Null
-    Start-Sleep -Milliseconds 300
 }
 
-if ($condaActivateBat) {
-    Write-Host "已启动「跟驰实验」全部视角终端窗口（已配置 conda activate $condaEnvName）。" -ForegroundColor Green
-} else {
-    Write-Host "已启动「跟驰实验」全部视角终端窗口。未找到 activate.bat，将依赖 conda 命令可用性。" -ForegroundColor Yellow
-}
+Start-ViewTerminal "CARLA Following Main View" "python .\car_following_experiment.py --host 127.0.0.1 --port 2000 --cabin --display 2 --res 1920x1080 --cabin-echo-interval 0.25 --four-experiments --experiment-scope following"
+Start-ViewTerminal "CARLA Left Camera"         "python .\cameras\Left.py --host 127.0.0.1 --port 2000 --display 1"
+Start-ViewTerminal "CARLA Right Camera"        "python .\cameras\Right.py --host 127.0.0.1 --port 2000 --display 3"
+Start-ViewTerminal "CARLA Back Camera"         "python .\cameras\Back.py --host 127.0.0.1 --port 2000 --display 1 --pos-x 832 --pos-y 20"
+Start-ViewTerminal "CARLA LeftBack Camera"     "python .\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 975 --pos-y 700"
+Start-ViewTerminal "CARLA RightBack Camera"    "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 975 --pos-y 760"
+
+exit 0

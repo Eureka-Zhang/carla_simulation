@@ -153,7 +153,7 @@ def main():
     argparser.add_argument("--generation", default="2", help="车辆代次")
     argparser.add_argument("--rolename", default="hero", help="自车角色名")
     argparser.add_argument("--lead-vehicle", default="vehicle.tesla.model3", help="前车蓝图")
-    argparser.add_argument("--lead-distance", default=50.0, type=float, help="前车初始距离（米）")
+    argparser.add_argument("--lead-distance", default=75.0, type=float, help="前车初始距离（米），默认75m")
 
     # 控制模式
     argparser.add_argument("--keyboard", action="store_true", help="使用键盘控制自车（默认使用驾驶舱）")
@@ -445,6 +445,7 @@ def main():
     def switch_phase(new_phase_idx: int):
         nonlocal phase_idx, pause_end_wall, phase_start_wall
         nonlocal overtake_phase_start_wall, overtake_cooldown_start_wall, overtake_prompt_pending, overtake_speed_reached
+        nonlocal center_prompt_text, center_prompt_until_wall
         _stop_segment_recording()
         phase_record_started["following"] = False
         phase_record_started["overtaking"] = False
@@ -460,6 +461,8 @@ def main():
         overtake_phase_start_wall = None
         overtake_prompt_pending = False
         overtake_speed_reached = False
+        center_prompt_text = ""
+        center_prompt_until_wall = 0.0
         if phases[phase_idx][0] == "overtaking":
             overtake_cooldown_start_wall = time.time()
             pause_end_wall = 0.0
@@ -609,7 +612,7 @@ def main():
                 hud.notification("跟驰阶段结束，自动切换到超车", seconds=2.0)
                 switch_phase(phase_idx + 1)
                 now_wall = time.time()
-                current_phase_name = phases[phase_idx][0]
+                current_phase_name, following_pause_active, overtaking_cooldown_active, phase_pause_active = _recompute_phase_flags()
 
             # 超车阶段：重生后先冷却10s，达到目标速度后提示超车，单次最大120s
             if current_phase_name == "overtaking" and (not phase_pause_active) and (phase_start_wall is not None):
@@ -637,7 +640,7 @@ def main():
                     hud.notification("超车阶段已达 120s，自动切回跟驰", seconds=2.0)
                     switch_phase(0)
                     now_wall = time.time()
-                    current_phase_name = phases[phase_idx][0]
+                    current_phase_name, following_pause_active, overtaking_cooldown_active, phase_pause_active = _recompute_phase_flags()
 
             # HUD 更新（不调用 World.tick，避免 lead_controller 在暂停期间被推进）
             world.hud.tick(world, clock)

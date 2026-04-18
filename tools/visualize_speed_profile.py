@@ -1,25 +1,26 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Visualize speed profiles for six experiments.
+Visualize speed profiles for the 4-experiment plan used by car_following_experiment.py.
 
 This script shows:
-1) Lead vehicle speed profile
+1) Following (irregular sinusoid) speed profile -- 180s
+2) Overtaking profiles for 3 target speeds     -- 120s each
 """
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-OVERTAKING_SPEEDS_KMH = [35.0, 50.0, 65.0]
-EXPERIMENT_DURATION_S = 200.0
+# 与 car_following_experiment.py 对齐
+OVERTAKING_SPEEDS_KMH = (35.0, 50.0, 65.0)
+FOLLOWING_DURATION_S = 180.0
+OVERTAKING_DURATION_S = 120.0
 
-# Keep these constants aligned with LeadVehicleController in car_following_experiment.py
+# 与 LeadVehicleController 常量对齐
 MAX_SPEED_MS = 28.0
-SMOOTH_FREQ_HZ = 1.0 / 70.0
-AGGRESSIVE_FREQ_HZ = 1.0 / 28.0
 OVERTAKING_RAMP_TIME_S = 16.0
-FOLLOWING_BASE_SPEED_MS = 65.0 / 3.6  # 跟驰中心速度 (km/h → m/s)，与 car_following_experiment 一致
-FOLLOWING_AMPLITUDE_MS = 15.0 / 3.6  # 跟驰幅值 (km/h)
+FOLLOWING_BASE_SPEED_MS = 65.0 / 3.6   # 跟驰中心速度 (km/h → m/s)
+FOLLOWING_AMPLITUDE_MS = 15.0 / 3.6    # 跟驰幅值 (km/h → m/s)
 FOLLOWING_STARTUP_RAMP_S = 18.0
 
 
@@ -31,50 +32,42 @@ def ms_to_kmh(value):
     return value * 3.6
 
 
-def following_target_speed(exp_type, elapsed):
+def following_irregular_target_speed(elapsed):
+    """跟驰实验（following_irregular）：启动 ramp 后使用慢+快正弦波混合。"""
     t = max(0.0, float(elapsed))
     base = FOLLOWING_BASE_SPEED_MS
     amp = FOLLOWING_AMPLITUDE_MS
 
-    # Match car_following_experiment.py: smooth startup from 0 to base speed.
+    # 0 → base 的 smoothstep 启动段，避免瞬时阶跃
     if t < FOLLOWING_STARTUP_RAMP_S:
         x = t / FOLLOWING_STARTUP_RAMP_S
-        s = x * x * (3.0 - 2.0 * x)  # smoothstep
+        s = x * x * (3.0 - 2.0 * x)
         return base * s
 
     t_wave = t - FOLLOWING_STARTUP_RAMP_S
-
-    if exp_type == "following_aggressive":
-        wave = np.sin(2.0 * np.pi * AGGRESSIVE_FREQ_HZ * t_wave)
-        target = base + amp * wave
-    elif exp_type == "following_irregular":
-        slow_wave = np.sin(2.0 * np.pi * (1.0 / 95.0) * t_wave)
-        fast_wave = np.sin(2.0 * np.pi * (1.0 / 26.0) * t_wave + 0.8)
-        blend = 0.5 * (1.0 + np.sin(2.0 * np.pi * (1.0 / 120.0) * t_wave - np.pi / 2.0))
-        wave = (1.0 - blend) * slow_wave + blend * fast_wave
-        target = base + amp * wave
-    else:
-        wave = np.sin(2.0 * np.pi * SMOOTH_FREQ_HZ * t_wave)
-        target = base + amp * wave
-
+    slow_wave = np.sin(2.0 * np.pi * (1.0 / 95.0) * t_wave)
+    fast_wave = np.sin(2.0 * np.pi * (1.0 / 26.0) * t_wave + 0.8)
+    blend = 0.5 * (1.0 + np.sin(2.0 * np.pi * (1.0 / 120.0) * t_wave - np.pi / 2.0))
+    wave = (1.0 - blend) * slow_wave + blend * fast_wave
+    target = base + amp * wave
     return max(0.0, min(MAX_SPEED_MS, target))
 
 
-def build_following_profile(exp_type, duration=EXPERIMENT_DURATION_S, dt=0.5):
+def build_following_profile(duration=FOLLOWING_DURATION_S, dt=0.5):
     times = np.arange(0.0, duration + dt, dt)
-    return [(float(t), float(following_target_speed(exp_type, t))) for t in times]
+    return [(float(t), float(following_irregular_target_speed(t))) for t in times]
 
 
-def build_overtaking_profile(speed_kmh):
+def build_overtaking_profile(speed_kmh, duration=OVERTAKING_DURATION_S, dt=0.5):
     target_ms = kmh_to_ms(speed_kmh)
-    sample_t = np.arange(0.0, EXPERIMENT_DURATION_S + 0.5, 0.5)
+    sample_t = np.arange(0.0, duration + dt, dt)
     profile = []
     for t in sample_t:
         if t >= OVERTAKING_RAMP_TIME_S:
             v = target_ms
         else:
             x = t / OVERTAKING_RAMP_TIME_S
-            s = x * x * (3.0 - 2.0 * x)  # smoothstep
+            s = x * x * (3.0 - 2.0 * x)
             v = target_ms * s
         profile.append((float(t), float(v)))
     return profile
@@ -95,38 +88,50 @@ def _plot_single(ax, lead_profile, title):
 
 
 def plot_speed_profile():
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=True, sharey=True)
+    # 4 组实验：1 跟驰 + 3 超车，采用 2x2 布局
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
-    following_defs = [
-        ("Exp 1: Following smooth sinusoid", "following_smooth"),
-        ("Exp 2: Following aggressive sinusoid", "following_aggressive"),
-        ("Exp 3: Following variable-frequency sinusoid", "following_irregular"),
-    ]
-    for i, (title, exp_type) in enumerate(following_defs):
-        profile = build_following_profile(exp_type)
-        _plot_single(axes[0, i], profile, title)
+    # Exp 1: Following (irregular)
+    _plot_single(
+        axes[0, 0],
+        build_following_profile(),
+        f"Exp 1: Following irregular (0~{int(FOLLOWING_DURATION_S)}s)",
+    )
 
+    # Exp 2/3/4: Overtaking at 3 target speeds
     for i, speed_kmh in enumerate(OVERTAKING_SPEEDS_KMH):
-        profile = build_overtaking_profile(speed_kmh)
-        title = f"Exp {i + 4}: Overtaking {speed_kmh:.0f} km/h"
-        _plot_single(axes[1, i], profile, title)
+        row = (i + 1) // 2
+        col = (i + 1) % 2
+        ax = axes[row, col]
+        _plot_single(
+            ax,
+            build_overtaking_profile(speed_kmh),
+            f"Exp {i + 2}: Overtaking {speed_kmh:.0f} km/h (0~{int(OVERTAKING_DURATION_S)}s)",
+        )
 
-    for ax in axes[1, :]:
+    # x 轴标签只在底部一行显示
+    for ax in axes[-1, :]:
         ax.set_xlabel("Time (s)")
 
-    axes[0, 0].set_ylim(0, 95)
-    fig.suptitle("Six-Experiment Speed Plan: 3 Following Styles + 3 Overtaking Speeds", fontsize=14)
+    # y 轴上限统一：跟驰最高约 80 km/h，超车最高 65 km/h → 留一些富余
+    for ax_row in axes:
+        for ax in ax_row:
+            ax.set_ylim(0, 95)
+
+    fig.suptitle("Four-Experiment Speed Plan: 1 Following Irregular + 3 Overtaking Speeds", fontsize=14)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("speed_profile_6_experiments.png", dpi=150, bbox_inches="tight")
-    print("Saved figure: speed_profile_6_experiments.png")
+    out_path = "speed_profile_4_experiments.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved figure: {out_path}")
     plt.show()
 
     print("\n=== Experiment Definitions ===")
-    print("Exp 1: Following smooth sinusoid around 65 +/- 15 km/h")
-    print("Exp 2: Following aggressive sinusoid around 65 +/- 15 km/h")
-    print("Exp 3: Following variable-frequency sinusoid around 65 +/- 15 km/h")
-    for i, speed_kmh in enumerate(OVERTAKING_SPEEDS_KMH, start=4):
-        print(f"Exp {i}: Overtaking, lead starts from 0 then reaches {speed_kmh:.0f} km/h")
+    print(f"Exp 1: Following irregular sinusoid around 65 +/- 15 km/h (duration {FOLLOWING_DURATION_S:.0f}s)")
+    for i, speed_kmh in enumerate(OVERTAKING_SPEEDS_KMH, start=2):
+        print(
+            f"Exp {i}: Overtaking, lead ramps from 0 to {speed_kmh:.0f} km/h "
+            f"over {OVERTAKING_RAMP_TIME_S:.0f}s then holds (total {OVERTAKING_DURATION_S:.0f}s)"
+        )
 
 
 if __name__ == "__main__":
