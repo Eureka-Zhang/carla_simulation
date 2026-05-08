@@ -7,10 +7,15 @@
 
 用法:
     python replay_trajectory.py <csv_file> [options]
-    
+
+多屏与正常驾驶一致：自车 role_name=hero，侧视/后视等相机脚本会附着同一辆车。
+可先启动本脚本再启动 cameras/*.py，或直接使用项目根目录的 launch_replay_all_views.ps1。
+加 --snap-to-road 时按地图 waypoint 对齐路面高度（坡道观感更好）。
+
 示例:
     python replay_trajectory.py ../experiment_data/20260302_032032/driving_data.csv
     python replay_trajectory.py ../experiment_data/20260302_032032/driving_data.csv --speed 2.0
+    python replay_trajectory.py ../experiment_data/20260302_032032/driving_data.csv --res 1920x1080 --display 2
 """
 
 import glob
@@ -153,6 +158,38 @@ def estimate_yaw(trajectory):
     return trajectory
 
 
+def make_road_z_resolver(world, enabled, z_offset, fallback_z=0.5):
+    """
+    若 enabled：用地图 waypoint 将 (x,y) 投影到可行驶车道，返回路面高度 + z_offset。
+    否则恒返回 fallback_z（与旧版固定高度一致）。
+    """
+    if not enabled:
+        return lambda _x, _y: fallback_z
+
+    carla_map = world.get_map()
+
+    def road_z(x, y):
+        # 较高 z 便于 project_to_road 从上方命中路面（桥梁/坡道）
+        loc = carla.Location(x=float(x), y=float(y), z=500.0)
+        wp = None
+        try:
+            wp = carla_map.get_waypoint(
+                loc, project_to_road=True, lane_type=carla.LaneType.Driving
+            )
+        except Exception:
+            wp = None
+        if wp is None:
+            try:
+                wp = carla_map.get_waypoint(loc, project_to_road=True)
+            except Exception:
+                wp = None
+        if wp is None:
+            return fallback_z
+        return wp.transform.location.z + z_offset
+
+    return road_z
+
+
 def draw_hud(display, font, point, frame, total_frames, speed_mult):
     """绘制HUD信息"""
     # 半透明背景
@@ -192,10 +229,31 @@ def main():
     argparser.add_argument('--ego-vehicle', default='vehicle.audi.tt', help='自车蓝图')
     argparser.add_argument('--lead-vehicle', default='vehicle.tesla.model3', help='前车蓝图')
     argparser.add_argument('--loop', action='store_true', help='循环回放')
+    argparser.add_argument('--res', default=None,
+                          help='窗口分辨率 WxH（与主实验一致），指定时覆盖 --width/--height')
     argparser.add_argument('--width', default=1280, type=int, help='窗口宽度')
     argparser.add_argument('--height', default=720, type=int, help='窗口高度')
+    argparser.add_argument('--display', default=0, type=int, help='显示器编号 (0,1,2…)，与 launch_all_views 多屏一致')
+    argparser.add_argument('--fullscreen', action='store_true', help='全屏（主实验同款）')
     argparser.add_argument('--no-lead', action='store_true', help='不显示前车')
+    argparser.add_argument(
+        '--snap-to-road',
+        action='store_true',
+        help='用 get_map().get_waypoint 将自车/前车 z 贴到路面（推荐有坡或桥时开启）',
+    )
+    argparser.add_argument(
+        '--snap-z-offset',
+        default=0.12,
+        type=float,
+        help='贴地后在路面高度上再抬高(米)，补偿车体原点与地面的间隙，默认 0.12',
+    )
     args = argparser.parse_args()
+
+    if args.res:
+        try:
+            args.width, args.height = [int(x) for x in args.res.split('x')]
+        except ValueError:
+            argparser.error('--res 格式应为 WxH，例如 1920x1080')
     
     # 加载轨迹
     print(f"加载轨迹: {args.csv_file}")
@@ -218,9 +276,13 @@ def main():
     pygame.font.init()
     font = pygame.font.Font(None, 24)  # 使用默认字体
     
+    display_flags = pygame.HWSURFACE | pygame.DOUBLEBUF
+    if args.fullscreen:
+        display_flags |= pygame.FULLSCREEN
     display = pygame.display.set_mode(
         (args.width, args.height),
-        pygame.HWSURFACE | pygame.DOUBLEBUF
+        display_flags,
+        display=args.display,
     )
     pygame.display.set_caption('轨迹回放 - 驾驶者视角')
     clock = pygame.time.Clock()
@@ -236,6 +298,29 @@ def main():
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = 0.05
     world.apply_settings(settings)
+
+    road_z = make_road_z_resolver(
+        world,
+        args.snap_to_road,
+        args.snap_z_offset,
+        fallback_z=0.5,
+    )
+    if args.snap_to_road:
+        print('贴地回放: 已启用 --snap-to-road (waypoint 对齐 z)')
+
+    # 清掉场景中同名 role 的旧车，避免多 hero / 相机绑到上一段回放的车辆（侧视颜色与切换异常）
+    try:
+        for a in world.get_actors().filter('vehicle.*'):
+            rn = a.attributes.get('role_name') or ''
+            if rn in ('hero', 'lead_vehicle'):
+                try:
+                    a.destroy()
+                except Exception:
+                    pass
+        for _ in range(5):
+            world.tick()
+    except Exception:
+        pass
     
     # 生成车辆
     bp_library = world.get_blueprint_library()
@@ -243,11 +328,14 @@ def main():
     # 自车 - 与主实验脚本一致
     ego_bp = bp_library.find(args.ego_vehicle)
     ego_bp.set_attribute('role_name', 'hero')
-    # 自车不设置颜色，使用默认
+    # 与 car_following_experiment.py 一致：白色车漆（Audi TT 等在车身上呈浅银观感）
+    if ego_bp.has_attribute('color'):
+        ego_bp.set_attribute('color', '255,255,255')
     
     start = trajectory[0]
+    z0_ego = road_z(start['ego_x'], start['ego_y'])
     ego_spawn = carla.Transform(
-        carla.Location(x=start['ego_x'], y=start['ego_y'], z=0.5),
+        carla.Location(x=start['ego_x'], y=start['ego_y'], z=z0_ego),
         carla.Rotation(yaw=start['ego_yaw'] if start['ego_yaw'] else 0)
     )
     ego_vehicle = world.spawn_actor(ego_bp, ego_spawn)
@@ -260,8 +348,9 @@ def main():
         lead_bp.set_attribute('role_name', 'lead_vehicle')
         if lead_bp.has_attribute('color'):
             lead_bp.set_attribute('color', '0,0,255')  # 蓝色，与主脚本一致
+        z0_lead = road_z(start['lead_x'], start['lead_y'])
         lead_spawn = carla.Transform(
-            carla.Location(x=start['lead_x'], y=start['lead_y'], z=0.5),
+            carla.Location(x=start['lead_x'], y=start['lead_y'], z=z0_lead),
             carla.Rotation(yaw=start['lead_yaw'] if start['lead_yaw'] else 0)
         )
         lead_vehicle = world.spawn_actor(lead_bp, lead_spawn)
@@ -294,10 +383,11 @@ def main():
             def apply_frame(idx):
                 """将 CSV 中 idx 对应的帧状态应用到 CARLA 实体（不包含 world.tick）。"""
                 p = trajectory[idx]
+                z_ego = road_z(p['ego_x'], p['ego_y'])
 
                 # 自车变换
                 ego_transform = carla.Transform(
-                    carla.Location(x=p['ego_x'], y=p['ego_y'], z=0.5),
+                    carla.Location(x=p['ego_x'], y=p['ego_y'], z=z_ego),
                     carla.Rotation(yaw=p['ego_yaw'] if p['ego_yaw'] else 0)
                 )
                 ego_vehicle.set_transform(ego_transform)
@@ -314,8 +404,9 @@ def main():
 
                 # 前车变换与速度
                 if lead_vehicle and p.get('lead_x') is not None:
+                    z_lead = road_z(p['lead_x'], p['lead_y'])
                     lead_transform = carla.Transform(
-                        carla.Location(x=p['lead_x'], y=p['lead_y'], z=0.5),
+                        carla.Location(x=p['lead_x'], y=p['lead_y'], z=z_lead),
                         carla.Rotation(yaw=p['lead_yaw'] if p.get('lead_yaw') else 0)
                     )
                     lead_vehicle.set_transform(lead_transform)
@@ -401,7 +492,9 @@ def main():
                                     world.tick()
                 
                 if paused:
-                    # 暂停时也要渲染
+                    # 同步模式下其它窗口 wait_for_tick：暂停也必须 tick，否则会全局卡住
+                    apply_frame(frame_idx)
+                    world.tick()
                     camera.render(display)
                     draw_hud(display, font, trajectory[frame_idx], frame_idx, len(trajectory), speed_mult)
                     pygame.display.flip()
@@ -410,14 +503,20 @@ def main():
                 
                 point = trajectory[frame_idx]
                 
-                # 计算目标时间
+                # 计算目标时间：CSV 时间戳间隔大时，不能长时间只 sleep 不 tick，
+                # 否则同步模式下侧视等进程卡在 wait_for_tick。
                 sim_time = point['timestamp'] - play_start_ts
                 target_time = sim_time / speed_mult
-                elapsed = time.time() - wall_start
-                
-                # 等待到目标时间
-                if target_time > elapsed:
-                    time.sleep(min(0.05, target_time - elapsed))
+                while True:
+                    elapsed = time.time() - wall_start
+                    if target_time <= elapsed:
+                        break
+                    rem = target_time - elapsed
+                    if rem > 0.05:
+                        time.sleep(0.05)
+                        world.tick()
+                    else:
+                        time.sleep(rem)
 
                 # 更新自车/前车状态（由 CSV 驱动）
                 apply_frame(frame_idx)
@@ -437,6 +536,7 @@ def main():
                 print("\n回放完成")
                 # 等待用户按键退出
                 while running:
+                    world.tick()
                     for event in pygame.event.get():
                         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
                             running = False

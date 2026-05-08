@@ -199,35 +199,37 @@ class SensorManager:
             print(f"[{self.config['name']}] 相机已销毁")
 
 
-def find_ego_vehicle(world, role_name='hero', timeout=30):
-    """查找主车"""
-    print(f"正在查找主车 (role_name={role_name})...")
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        actor_list = world.get_actors().filter('vehicle.*')
-        for vehicle in actor_list:
-            if vehicle.attributes.get('role_name') == role_name:
-                print(f"找到主车: {vehicle.type_id}")
-                return vehicle
-        time.sleep(0.5)
-        
-    print(f"超时: 未找到主车 (role_name={role_name})")
-    return None
-
-
 def find_ego_vehicle_once(world, role_name='hero'):
     """仅做一次快速查找（不 sleep），用于 hero 重启后的自动重绑。"""
     try:
+        matches = []
         actor_list = world.get_actors().filter('vehicle.*')
         for vehicle in actor_list:
             try:
                 if vehicle.attributes.get('role_name') == role_name:
-                    return vehicle
+                    matches.append(vehicle)
             except Exception:
                 continue
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        return max(matches, key=lambda v: v.id)
     except Exception:
         return None
+
+
+def find_ego_vehicle(world, role_name='hero', timeout=30):
+    """查找主车（多辆同 role 时取 id 最大）。"""
+    print(f"正在查找主车 (role_name={role_name})...")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        v = find_ego_vehicle_once(world, role_name)
+        if v is not None:
+            print(f"找到主车: {v.type_id} id={v.id}")
+            return v
+        time.sleep(0.5)
+    print(f"超时: 未找到主车 (role_name={role_name})")
     return None
 
 

@@ -1,9 +1,15 @@
-﻿$ErrorActionPreference = "Stop"
+﻿param(
+    [switch]$ForceMultiDisplay
+)
+
+$ErrorActionPreference = "Stop"
 
 # 一键启动前置熟悉实验主视角 + 多相机视角（每个进程一个独立终端窗口）
 # 用法：
 #   1) 在项目根目录执行：powershell -ExecutionPolicy Bypass -File .\launch_pre_familiarization_all_views.ps1
 #   2) 或直接右键“使用 PowerShell 运行”
+# 多屏布局需要至少 4 台显示器（脚本使用 display 0–3）。不足时自动改为全部 --display 0，避免 Pygame 无法建窗。
+# 若确有多屏但检测异常，可加：-ForceMultiDisplay
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $condaEnvName = "carla39"
@@ -16,6 +22,17 @@ $condaActivateCandidates = @(
     "$env:USERPROFILE\miniconda3\Scripts\activate.bat"
 )
 $condaActivateBat = $condaActivateCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+# 本启动器使用的最大显示器编号为 3，需至少 4 块屏才能安全使用原布局；否则 Pygame set_mode(display=N) 会失败（表现为“没有窗口”）。
+$minimumScreensForLayout = 4
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $screenCount = [System.Windows.Forms.Screen]::AllScreens.Count
+}
+catch {
+    $screenCount = 1
+}
+$useMultiDisplayLayout = $ForceMultiDisplay -or ($screenCount -ge $minimumScreensForLayout)
 
 $jobs = @(
     @{
@@ -43,6 +60,13 @@ $jobs = @(
         Command = "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 975 --pos-y 760"
     }
 )
+
+if (-not $useMultiDisplayLayout) {
+    Write-Host "检测到显示器数量: $screenCount （多屏布局至少需要 $minimumScreensForLayout 台）。已将各窗口改为 --display 0（主显示器）。" -ForegroundColor Yellow
+    $jobs = foreach ($j in $jobs) {
+        @{ Title = $j.Title; Command = ($j.Command -replace '--display\s+\d+', '--display 0') }
+    }
+}
 
 foreach ($job in $jobs) {
     if ($condaActivateBat) {

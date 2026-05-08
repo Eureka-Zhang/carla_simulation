@@ -139,6 +139,33 @@ def kmh_to_ms(kmh):
     return kmh / 3.6
 
 
+def ego_front_to_lead_rear_distance_xy(ego_vehicle, lead_vehicle):
+    """自车车头中点到前车车尾中点，在水平面 (XY) 上的欧氏距离。
+
+    使用车体包围盒：CARLA 车辆局部 +x 为车头方向，bbox.location 为盒中心在车身坐标系中的位置。
+    """
+    ego_tf = ego_vehicle.get_transform()
+    lead_tf = lead_vehicle.get_transform()
+    eb = ego_vehicle.bounding_box
+    lb = lead_vehicle.bounding_box
+    ego_front_local = carla.Location(
+        eb.location.x + eb.extent.x,
+        eb.location.y,
+        eb.location.z,
+    )
+    lead_rear_local = carla.Location(
+        lb.location.x - lb.extent.x,
+        lb.location.y,
+        lb.location.z,
+    )
+    ego_front = ego_tf.transform(ego_front_local)
+    lead_rear = lead_tf.transform(lead_rear_local)
+    return math.sqrt(
+        (ego_front.x - lead_rear.x) ** 2
+        + (ego_front.y - lead_rear.y) ** 2
+    )
+
+
 # ==============================================================================
 # -- 全局函数 ------------------------------------------------------------------
 # ==============================================================================
@@ -696,15 +723,10 @@ class DataCollector:
             if lead_acc.x * lead_velocity.x + lead_acc.y * lead_velocity.y < 0:
                 lead_acceleration = -lead_acceleration
                 
-            # 跟驰特征 - 使用实际车辆尺寸
-            ego_length = ego_vehicle.bounding_box.extent.x * 2
-            lead_length = lead_vehicle.bounding_box.extent.x * 2
-            
-            distance = math.sqrt(
-                (ego_transform.location.x - lead_transform.location.x)**2 +
-                (ego_transform.location.y - lead_transform.location.y)**2
+            # 跟驰特征：自车车头 → 前车车尾（XY），与 HUD 一致
+            distance_headway = ego_front_to_lead_rear_distance_xy(
+                ego_vehicle, lead_vehicle
             )
-            distance_headway = max(0, distance - (ego_length + lead_length) / 2)
             
             relative_speed = ego_speed - lead_speed
             time_headway = distance_headway / ego_speed if ego_speed > 0.5 else 999.0
@@ -2343,9 +2365,9 @@ class VehicleController:
         ego_speed = math.sqrt(ego_vel.x**2 + ego_vel.y**2 + ego_vel.z**2)
         lead_speed = math.sqrt(lead_vel.x**2 + lead_vel.y**2 + lead_vel.z**2)
         
-        ego_loc = world.player.get_location()
-        lead_loc = world.lead_vehicle.get_location()
-        distance = math.sqrt((ego_loc.x - lead_loc.x)**2 + (ego_loc.y - lead_loc.y)**2)
+        distance = ego_front_to_lead_rear_distance_xy(
+            world.player, world.lead_vehicle
+        )
         
         # IDM参数
         desired_thw = SAFE_TIME_HEADWAY
@@ -2457,6 +2479,8 @@ class HUD:
         if chinese_font:
             print(f"使用中文字体: {os.path.basename(chinese_font)}")
             self._font_mono = pygame.font.Font(chinese_font, 14)
+            # 左侧 HUD：自车/前车速度行单独放大（相对 mono 14px 的 4 倍）
+            self._font_mono_speed = pygame.font.Font(chinese_font, 14 * 4)
             self._font_chinese = pygame.font.Font(chinese_font, 18)
             self._font_chinese_large = pygame.font.Font(chinese_font, 20)
             self._font_cooldown = pygame.font.Font(chinese_font, 64)
@@ -2469,6 +2493,7 @@ class HUD:
             mono = default_font if default_font in fonts else (fonts[0] if fonts else None)
             mono = pygame.font.match_font(mono) if mono else None
             self._font_mono = pygame.font.Font(mono, 14) if mono else pygame.font.Font(None, 14)
+            self._font_mono_speed = pygame.font.Font(mono, 14 * 4) if mono else pygame.font.Font(None, 14 * 4)
             self._font_chinese = pygame.font.Font(pygame.font.get_default_font(), 18)
             self._font_chinese_large = pygame.font.Font(pygame.font.get_default_font(), 20)
             self._font_cooldown = pygame.font.Font(pygame.font.get_default_font(), 64)
@@ -2512,29 +2537,27 @@ class HUD:
             '方向: %14.2f' % c.steer,
         ]
 
-        # 行车信息（自车速度 / 前车速度 / 车头间距）
+        # 行车信息（自车 / 前车 / 车头-车尾间距）
         if world.lead_vehicle:
-            lead_loc = world.lead_vehicle.get_location()
             lead_vel = world.lead_vehicle.get_velocity()
             lead_speed = 3.6 * math.sqrt(lead_vel.x**2 + lead_vel.y**2 + lead_vel.z**2)
 
-            distance = math.sqrt(
-                (t.location.x - lead_loc.x)**2 +
-                (t.location.y - lead_loc.y)**2
+            distance = ego_front_to_lead_rear_distance_xy(
+                world.player, world.lead_vehicle
             )
 
             self._info_text.extend([
                 '',
                 '--- 行车信息 ---',
-                '自车速度: %9.0f km/h' % speed,
-                '前车速度: %9.0f km/h' % lead_speed,
+                '自车: %9.0f km/h' % speed,
+                '前车: %9.0f km/h' % lead_speed,
                 '车头间距: %9.1f m' % distance,
             ])
         else:
             self._info_text.extend([
                 '',
                 '--- 行车信息 ---',
-                '自车速度: %9.0f km/h' % speed,
+                '自车: %9.0f km/h' % speed,
             ])
         
         # 数据采集状态
@@ -2599,19 +2622,60 @@ class HUD:
         ss = int(seconds % 60)
         return f"{mm:02d}:{ss:02d}"
 
+    @staticmethod
+    def _is_left_hud_speed_line(item):
+        # 须与 tick() 里 _info_text 的「自车:」「前车:」前缀一致
+        return bool(item) and (
+            item.startswith('自车:') or item.startswith('前车:')
+        )
+
+    @staticmethod
+    def _hud_speed_line_split_unit(item):
+        """自车/前车行：拆成「标签+数值」与「 km/h」，单位保持与 _font_mono 同档小字。"""
+        if item.endswith(' km/h'):
+            return item[:-5], ' km/h'
+        return None, None
+
     def render(self, display):
         if self._show_info:
-            info_surface = pygame.Surface((250, self.dim[1]))
+            info_surface = pygame.Surface((400, self.dim[1]))
             info_surface.set_alpha(100)
             display.blit(info_surface, (0, 0))
             v_offset = 4
             for item in self._info_text:
-                if v_offset + 18 > self.dim[1]:
-                    break
-                if item:
-                    surface = self._font_mono.render(item, True, (255, 255, 255))
+                if not item:
+                    if v_offset + 18 > self.dim[1]:
+                        break
+                    v_offset += 18
+                    continue
+                use_speed_font = self._is_left_hud_speed_line(item)
+                main_part, unit_part = (
+                    self._hud_speed_line_split_unit(item)
+                    if use_speed_font
+                    else (None, None)
+                )
+                if use_speed_font and main_part is not None:
+                    main_s = self._font_mono_speed.render(
+                        main_part, True, (255, 255, 255)
+                    )
+                    unit_s = self._font_mono.render(
+                        unit_part, True, (255, 255, 255)
+                    )
+                    step = max(18, main_s.get_height() + 6)
+                    if v_offset + step > self.dim[1]:
+                        break
+                    uy = v_offset + main_s.get_height() - unit_s.get_height()
+                    display.blit(main_s, (8, v_offset))
+                    display.blit(unit_s, (8 + main_s.get_width(), uy))
+                    v_offset += step
+                else:
+                    font = self._font_mono_speed if use_speed_font else self._font_mono
+                    surface = font.render(item, True, (255, 255, 255))
+                    step = max(18, surface.get_height() + 6) if use_speed_font else 18
+                    if v_offset + step > self.dim[1]:
+                        break
                     display.blit(surface, (8, v_offset))
-                v_offset += 18
+                    v_offset += step
         self._notifications.render(display)
         # 冷却中：中央显示倒计时；否则在实验进行中右上角显示倒计时
         if self._cooldown_remaining_s > 0.0:
