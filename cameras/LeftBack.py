@@ -15,6 +15,7 @@ import os
 import sys
 import argparse
 import ctypes
+import threading
 from ctypes import wintypes
 
 # 添加CARLA路径
@@ -63,11 +64,23 @@ CAMERA_CONFIG = {
 }
 
 
+def _nudge_pixels_matching_colorkey(rgb, ck_rgb):
+    """避免画面像素与窗口 colorkey 完全一致时被分层窗口抠穿（镜面闪烁）。"""
+    r0, g0, b0 = int(ck_rgb[0]), int(ck_rgb[1]), int(ck_rgb[2])
+    mask = (rgb[:, :, 0] == r0) & (rgb[:, :, 1] == g0) & (rgb[:, :, 2] == b0)
+    if not np.any(mask):
+        return
+    g = rgb[:, :, 1].astype(np.int16)
+    g[mask] = np.where(g[mask] < 255, g[mask] + 1, g[mask] - 1)
+    rgb[:, :, 1] = g.astype(np.uint8)
+
+
 class SensorManager:
     """传感器管理器"""
     
     def __init__(self, world, car, config):
         self.surface = None
+        self._surface_lock = threading.Lock()
         self.world = world
         self.car = car
         self.config = config
@@ -96,12 +109,16 @@ class SensorManager:
         array = np.frombuffer(image.raw_data, dtype=np.uint8)
         array = np.reshape(array, (image.height, image.width, 4))
         rgb = array[:, :, :3][:, :, ::-1].copy(order="C")  # BGRA -> RGB，并确保连续内存
+        if self.config.get('transparent_outside', False):
+            ck = self.config.get('transparent_colorkey', (255, 0, 255))
+            _nudge_pixels_matching_colorkey(rgb, ck)
         surface = pygame.image.frombuffer(rgb.tobytes(), (image.width, image.height), "RGB")
         
         if self.config.get('flip', False):
             surface = pygame.transform.flip(surface, True, False)
             
-        self.surface = surface
+        with self._surface_lock:
+            self.surface = surface
 
     def _crop_to_mirror_aspect(self, surface):
         """将原始画面居中裁剪到后视镜比例，避免“过高”的画面塞不进镜面。"""
@@ -163,16 +180,19 @@ class SensorManager:
         mask.set_colorkey(inside_marker)
         display.blit(mask, (0, 0))
 
+        # 透明窗口下 outside 即 colorkey：在镜面上描边会把整块抠穿，边缘会随画面剧烈闪烁
         feather = int(self.config.get('trapezoid_feather', 0) or 0)
-        if feather > 0:
+        if feather > 0 and not self.config.get('transparent_outside', False):
             for i in range(len(pts)):
                 p1 = pts[i]
                 p2 = pts[(i + 1) % len(pts)]
                 pygame.draw.line(display, outside, p1, p2, feather)
 
     def render(self, display):
-        if self.surface is not None:
-            mirror_surface = self._crop_to_mirror_aspect(self.surface)
+        with self._surface_lock:
+            surf = self.surface
+        if surf is not None:
+            mirror_surface = self._crop_to_mirror_aspect(surf)
             src_w, src_h = mirror_surface.get_size()
             dst_w, dst_h = display.get_size()
             if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
@@ -385,8 +405,11 @@ def main():
         client.set_timeout(20.0)
         world = client.get_world()
         
-        display_flags = pygame.NOFRAME | pygame.DOUBLEBUF
-            
+        # 分层透明窗口 + DOUBLEBUF 在部分显卡上易闪；透明模式用单缓冲
+        display_flags = pygame.NOFRAME
+        if not CAMERA_CONFIG.get('transparent_outside', False):
+            display_flags |= pygame.DOUBLEBUF
+
         display = pygame.display.set_mode(
             (args.width, args.height), 
             display_flags, 

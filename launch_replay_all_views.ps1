@@ -126,7 +126,8 @@ if (-not $useMultiDisplayLayout) {
 Write-Host "Resolved CSV: $CsvPath" -ForegroundColor DarkGray
 Write-Host "Pygame display indices — main:$dMain left:$dLeft right:$dRight back:$dBack leftBack:$dLb rightBack:$dRb (screens detected: $screenCount)" -ForegroundColor DarkGray
 
-$replayCmd = "python .\tools\replay_trajectory.py `"$CsvPath`" --host $CarlaHost --port $CarlaPort --res 1920x1080 --display $dMain --snap-to-road"
+# replay_trajectory 默认关闭车辆物理 + 贴地 z 平滑，避免主视角/侧视相机跟车抖动；需悬挂效果可加 --vehicle-physics
+$replayCmd = "python .\tools\replay_trajectory.py `"$CsvPath`" --host $CarlaHost --port $CarlaPort --res 1920x1080 --display $dMain --snap-to-road --z-smooth-alpha 0.2 --z-smooth-max-step 0.06"
 
 $cameraJobs = @(
     @{
