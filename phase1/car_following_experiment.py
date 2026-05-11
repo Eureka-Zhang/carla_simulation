@@ -177,6 +177,28 @@ def find_weather_presets():
     return [(getattr(carla.WeatherParameters, x), name(x)) for x in presets]
 
 
+def apply_default_day_weather(world):
+    """与回放脚本一致：晴天白天，避免沿用上一段客户端留在服务器上的多云天气。"""
+    try:
+        preset = getattr(carla.WeatherParameters, 'ClearNoon', None)
+        if preset is not None:
+            world.set_weather(preset)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def index_of_clear_noon_in_presets(weather_presets):
+    cn = getattr(carla.WeatherParameters, 'ClearNoon', None)
+    if cn is None:
+        return 0
+    for i, (wp, _) in enumerate(weather_presets):
+        if wp is cn:
+            return i
+    return 0
+
+
 def get_actor_display_name(actor, truncate=250):
     name = ' '.join(actor.type_id.replace('_', '.').title().split('.')[1:])
     return (name[:truncate - 1] + u'\u2026') if len(name) > truncate else name
@@ -2931,6 +2953,12 @@ class CameraManager:
             bp.set_attribute('image_size_y', str(hud.dim[1]))
             if bp.has_attribute('gamma'):
                 bp.set_attribute('gamma', str(gamma_correction))
+            # 与 tools/replay_trajectory.py DriverCamera 一致：驾驶员 RGB 固定 FOV、关运动模糊
+            if item[0] == 'sensor.camera.rgb':
+                if bp.has_attribute('fov'):
+                    bp.set_attribute('fov', '90')
+                if bp.has_attribute('motion_blur_intensity'):
+                    bp.set_attribute('motion_blur_intensity', '0')
             item.append(bp)
         self.index = None
 
@@ -3349,6 +3377,11 @@ def main():
     # 模式设置
     argparser.add_argument('--sync', action='store_true', default=True, help='启用同步模式')
     argparser.add_argument('--no-sync', dest='sync', action='store_false', help='禁用同步模式')
+    argparser.add_argument(
+        '--keep-world-weather',
+        action='store_true',
+        help='启动时不重置天气。默认设为 ClearNoon，避免回放等脚本改过云量后残留在本脚本里',
+    )
     argparser.add_argument('--keyboard', action='store_true', help='键盘控制模式')
     argparser.add_argument('--cabin', action='store_true', help='驾驶舱控制模式')
     

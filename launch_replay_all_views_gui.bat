@@ -1,6 +1,7 @@
 @echo off
-REM Double-click: pick CSV in dialog, then start replay + all camera windows.
-REM Prefer Windows PowerShell 5.1 (STA by default). If only pwsh exists, the .ps1 uses STA runspace for the file dialog.
+REM Double-click: file dialog, then L4 replay + cameras (tools/replay_trajectory.py).
+REM For L3 use launch_replay_all_views_l3.bat in this folder.
+REM Use Windows PowerShell 5.1 if available (STA). Save this file as ANSI if cmd shows junk characters.
 
 cd /d "%~dp0"
 set "PSX=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"

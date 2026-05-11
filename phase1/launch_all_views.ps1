@@ -2,7 +2,8 @@
 
 # 一键启动主视角 + 多相机视角（每个进程一个独立终端窗口）
 # 用法：
-#   1) 在项目根目录执行：powershell -ExecutionPolicy Bypass -File .\launch_all_views.ps1
+#   1) 在 phase1 目录执行：powershell -ExecutionPolicy Bypass -File .\launch_all_views.ps1
+#      或在仓库根目录：powershell -ExecutionPolicy Bypass -File .\phase1\launch_all_views.ps1
 #   2) 或直接右键“使用 PowerShell 运行”
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -24,23 +25,23 @@ $jobs = @(
     },
     @{
         Title   = "CARLA Left Camera"
-        Command = "python .\cameras\Left.py --host 127.0.0.1 --port 2000 --display 1"
+        Command = "python ..\cameras\Left.py --host 127.0.0.1 --port 2000 --display 1"
     },
     @{
         Title   = "CARLA Right Camera"
-        Command = "python .\cameras\Right.py --host 127.0.0.1 --port 2000 --display 3"
+        Command = "python ..\cameras\Right.py --host 127.0.0.1 --port 2000 --display 3"
     },
     @{
         Title   = "CARLA Back Camera"
-        Command = "python .\cameras\Back.py --host 127.0.0.1 --port 2000 --display 1 --pos-x 832 --pos-y 20"
+        Command = "python ..\cameras\Back.py --host 127.0.0.1 --port 2000 --display 1 --pos-x 832 --pos-y 20"
     },
     @{
         Title   = "CARLA LeftBack Camera"
-        Command = "python .\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 975 --pos-y 700"
+        Command = "python ..\cameras\LeftBack.py --host 127.0.0.1 --port 2000 --display 0 --pos-x 975 --pos-y 700"
     },
     @{
         Title   = "CARLA RightBack Camera"
-        Command = "python .\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 975 --pos-y 760"
+        Command = "python ..\cameras\RightBack.py --host 127.0.0.1 --port 2000 --display 2 --pos-x 975 --pos-y 760"
     }
 )
 

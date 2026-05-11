@@ -3,7 +3,8 @@
 #
 # 用法（在项目根目录）:
 #   powershell -ExecutionPolicy Bypass -File .\launch_replay_all_views.ps1 -CsvPath ".\experiment_data\xxx\driving_data.csv"
-# 未传 -CsvPath 时（例如双击本脚本）会弹出文件框选择 driving_data.csv；或双击 launch_replay_all_views_gui.bat
+#   L3（空格心理接管提示）: 加 -ReplayMode L3；默认 L4 使用 tools\replay_trajectory.py
+# 未传 -CsvPath 时（例如双击本脚本）会弹出文件框选择 driving_data.csv；或双击 launch_replay_all_views_gui.bat / launch_replay_all_views_l3.bat
 #
 # 可选: -CarlaHost / -CarlaPort / -CameraStartupDelaySec（秒，回放窗口先启动，再开相机，避免找不到 hero）
 # 多屏布局需至少 4 台显示器（使用 display 0–3）；不足时自动改为全部 --display 0。-ForceMultiDisplay 可跳过回退。
@@ -13,7 +14,9 @@ param(
     [string]$CsvPath = '',
     [string]$CarlaHost = "127.0.0.1",
     [int]$CarlaPort = 2000,
-    [int]$CameraStartupDelaySec = 8,
+    [double]$CameraStartupDelaySec = 1.5,
+    [ValidateSet('L4', 'L3')]
+    [string]$ReplayMode = 'L4',
     [switch]$ForceMultiDisplay
 )
 
@@ -124,10 +127,15 @@ if (-not $useMultiDisplayLayout) {
 }
 
 Write-Host "Resolved CSV: $CsvPath" -ForegroundColor DarkGray
-Write-Host "Pygame display indices — main:$dMain left:$dLeft right:$dRight back:$dBack leftBack:$dLb rightBack:$dRb (screens detected: $screenCount)" -ForegroundColor DarkGray
+Write-Host "Pygame display indices - main:$dMain left:$dLeft right:$dRight back:$dBack leftBack:$dLb rightBack:$dRb (screens detected: $screenCount)" -ForegroundColor DarkGray
 
-# replay_trajectory 默认关闭车辆物理 + 贴地 z 平滑，避免主视角/侧视相机跟车抖动；需悬挂效果可加 --vehicle-physics
-$replayCmd = "python .\tools\replay_trajectory.py `"$CsvPath`" --host $CarlaHost --port $CarlaPort --res 1920x1080 --display $dMain --snap-to-road --z-smooth-alpha 0.2 --z-smooth-max-step 0.06"
+# Use absolute quoted paths so cmd.exe after conda activate still runs the replay script (not the CSV as Python input).
+$replayPyFile = if ($ReplayMode -eq 'L3') {
+    Join-Path $projectRoot 'tools\replay_trajectory_l3.py'
+} else {
+    Join-Path $projectRoot 'tools\replay_trajectory.py'
+}
+$replayCmd = "python `"$replayPyFile`" `"$CsvPath`" --host $CarlaHost --port $CarlaPort --res 1920x1080 --display $dMain --snap-to-road --z-smooth-alpha 0.2 --z-smooth-max-step 0.06"
 
 $cameraJobs = @(
     @{
@@ -164,8 +172,9 @@ function Start-CmdJob {
     Start-Process -FilePath "cmd.exe" -ArgumentList @('/k', $cmdLine) | Out-Null
 }
 
-Write-Host "Starting replay main window (ensure CARLA is running)..." -ForegroundColor Cyan
-Start-CmdJob -Title "CARLA Replay Main View" -Command $replayCmd
+Write-Host "Starting replay main window ($ReplayMode, ensure CARLA is running)..." -ForegroundColor Cyan
+$replayTitle = if ($ReplayMode -eq 'L3') { 'CARLA Replay Main View (L3)' } else { 'CARLA Replay Main View (L4)' }
+Start-CmdJob -Title $replayTitle -Command $replayCmd
 
 Write-Host "Waiting ${CameraStartupDelaySec}s for hero vehicle, then starting camera windows..." -ForegroundColor Yellow
 Start-Sleep -Seconds $CameraStartupDelaySec
