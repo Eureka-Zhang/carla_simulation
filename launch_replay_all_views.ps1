@@ -4,14 +4,15 @@
 # 用法（在项目根目录）:
 #   powershell -ExecutionPolicy Bypass -File .\launch_replay_all_views.ps1 -CsvPath ".\experiment_data\xxx\driving_data.csv"
 #   L3（空格心理接管提示）: 加 -ReplayMode L3；默认 L4 使用 tools\replay_trajectory.py
-# 未传 -CsvPath 时（例如双击本脚本）会弹出文件框选择 driving_data.csv；或双击 launch_replay_all_views_gui.bat / launch_replay_all_views_l3.bat
+# 未传 -CsvPath 时（例如双击本脚本）会弹出文件框选择 driving_data.csv；默认打开 phase2\residual_gru_takeover_20s_yaw_shrink_controls（可用 -InitialCsvBrowseFolder 覆盖）
 #
-# 可选: -CarlaHost / -CarlaPort / -CameraStartupDelaySec（秒，回放窗口先启动，再开相机，避免找不到 hero）
+# 可选: -CarlaHost / -CarlaPort / -CameraStartupDelaySec / -InitialCsvBrowseFolder
 # 多屏布局需至少 4 台显示器（使用 display 0–3）；不足时自动改为全部 --display 0。-ForceMultiDisplay 可跳过回退。
 
 param(
     [Parameter(Mandatory = $false, Position = 0)]
     [string]$CsvPath = '',
+    [string]$InitialCsvBrowseFolder = '',
     [string]$CarlaHost = "127.0.0.1",
     [int]$CarlaPort = 2000,
     [double]$CameraStartupDelaySec = 1.5,
@@ -26,16 +27,23 @@ $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $condaEnvName = "carla39"
 
 function Get-CsvPathViaOpenFileDialogSta {
-    param([string]$Root)
+    param(
+        [string]$ProjectRoot,
+        [string]$InitialBrowse
+    )
     # WinForms OpenFileDialog requires STA; pwsh / MTA thread throws — run picker on STA runspace
     $picker = {
-        param($R)
+        param($PR, $IB)
         Add-Type -AssemblyName System.Windows.Forms
-        $exp = Join-Path $R 'experiment_data'
+        $init = $IB
+        if (-not (Test-Path -LiteralPath $init)) {
+            $exp = Join-Path $PR 'experiment_data'
+            if (Test-Path -LiteralPath $exp) { $init = $exp } else { $init = $PR }
+        }
         $dlg = New-Object System.Windows.Forms.OpenFileDialog
         $dlg.Filter = 'CSV (*.csv)|*.csv|All files (*.*)|*.*'
         $dlg.Title = 'Select driving_data.csv for replay'
-        if (Test-Path -LiteralPath $exp) { $dlg.InitialDirectory = $exp } else { $dlg.InitialDirectory = $R }
+        $dlg.InitialDirectory = $init
         $dlg.FileName = 'driving_data.csv'
         if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             return $dlg.FileName
@@ -47,7 +55,7 @@ function Get-CsvPathViaOpenFileDialogSta {
     $rs.Open()
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
-    [void]$ps.AddScript($picker).AddArgument($Root)
+    [void]$ps.AddScript($picker).AddArgument($ProjectRoot).AddArgument($InitialBrowse)
     try {
         $out = $ps.Invoke()
         foreach ($e in $ps.Streams.Error) {
@@ -74,7 +82,13 @@ $condaActivateBat = $condaActivateCandidates | Where-Object { Test-Path $_ } | S
 
 if ([string]::IsNullOrWhiteSpace($CsvPath)) {
     try {
-        $picked = Get-CsvPathViaOpenFileDialogSta -Root $projectRoot
+        $browseStart = if (-not [string]::IsNullOrWhiteSpace($InitialCsvBrowseFolder)) {
+            $InitialCsvBrowseFolder.Trim().Trim('"')
+        }
+        else {
+            Join-Path $projectRoot 'phase2\residual_gru_takeover_20s_yaw_shrink_controls'
+        }
+        $picked = Get-CsvPathViaOpenFileDialogSta -ProjectRoot $projectRoot -InitialBrowse $browseStart
         if ([string]::IsNullOrWhiteSpace($picked)) {
             Write-Host 'No file selected. Exiting.' -ForegroundColor Yellow
             exit 0

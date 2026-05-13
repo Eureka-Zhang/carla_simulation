@@ -446,74 +446,144 @@ def draw_hud(display, point, display_size, font_mono, font_mono_speed, font_titl
     v_offset = 44
     v_offset += draw_metric_line(v_offset, "自车", f"{ego_kmh:.0f}", "km/h")
     v_offset += draw_metric_line(v_offset, "前车", lead_value, "km/h")
-    draw_metric_line(v_offset, "车头间距", dist_value, "m")
+    v_offset += draw_metric_line(v_offset, "车头间距", dist_value, "m")
+    return v_offset
 
 
-def main():
-    argparser = argparse.ArgumentParser(description='轨迹回放工具 - 驾驶者视角')
-    argparser.add_argument('csv_file', help='CSV数据文件路径')
-    argparser.add_argument('--host', default='127.0.0.1', help='CARLA服务器IP')
-    argparser.add_argument('-p', '--port', default=2000, type=int, help='CARLA服务器端口')
-    argparser.add_argument('--speed', default=1.0, type=float, help='回放速度倍率 (默认1.0)')
-    argparser.add_argument('--seek-step-pct', default=1.0, type=float,
-                          help='进度跳转步长(占总帧百分比)。默认1%%，按←/→时生效')
-    argparser.add_argument('--seek-big-step-pct', default=10.0, type=float,
-                          help='进度大步跳转(占总帧百分比)。默认10%%，按PgUp/PgDn时生效')
-    argparser.add_argument('--ego-vehicle', default='vehicle.audi.tt', help='自车蓝图')
-    argparser.add_argument('--lead-vehicle', default='vehicle.tesla.model3', help='前车蓝图')
-    argparser.add_argument('--loop', action='store_true', help='循环回放')
-    argparser.add_argument('--res', default=None,
-                          help='窗口分辨率 WxH（与主实验一致），指定时覆盖 --width/--height')
-    argparser.add_argument('--width', default=1280, type=int, help='窗口宽度')
-    argparser.add_argument('--height', default=720, type=int, help='窗口高度')
-    argparser.add_argument('--display', default=0, type=int, help='显示器编号 (0,1,2…)，与 launch_all_views 多屏一致')
-    argparser.add_argument('--fullscreen', action='store_true', help='全屏（主实验同款）')
-    argparser.add_argument('--no-lead', action='store_true', help='不显示前车')
-    argparser.add_argument(
+def _fmt_mm_ss(seconds):
+    seconds = max(0.0, float(seconds))
+    mm = int(seconds // 60)
+    ss = int(seconds % 60)
+    return f'{mm:02d}:{ss:02d}'
+
+
+def resolve_playback_start_frame_index(trajectory, play_start_ts, sim_offset_s):
+    """
+    首帧满足 sim_time >= sim_offset_s 的帧索引（sim_time = timestamp - play_start_ts）。
+    sim_offset_s <= 0 时返回 0；若无帧达到阈值则返回最后一帧索引。
+    """
+    if not trajectory:
+        return 0
+    target = float(sim_offset_s)
+    if target <= 0.0:
+        return 0
+    for i, pt in enumerate(trajectory):
+        if pt['timestamp'] - play_start_ts >= target:
+            return i
+    return len(trajectory) - 1
+
+
+def draw_center_countdown_lines(display, font_large, lines, width, height):
+    """屏幕中央多行文字（与主实验 HUD 冷却倒计时风格一致：白字 + 阴影）。"""
+    if not lines:
+        return
+    color = (255, 255, 255)
+    shadow_color = (0, 0, 0)
+    rendered = [
+        (font_large.render(line, True, color), font_large.render(line, True, shadow_color))
+        for line in lines
+    ]
+    line_gap = 10
+    total_h = sum(s.get_height() for s, _ in rendered) + line_gap * max(0, len(rendered) - 1)
+    ty = (height - total_h) // 2
+    for surface, shadow in rendered:
+        tx = (width - surface.get_width()) // 2
+        display.blit(shadow, (tx + 3, ty + 3))
+        display.blit(surface, (tx, ty))
+        ty += surface.get_height() + line_gap
+
+
+def make_countdown_font():
+    """中央倒计时大字（与 car_following_experiment HUD 冷却档接近）。"""
+    path = find_chinese_font()
+    size = 48
+    if path:
+        return pygame.font.Font(path, size)
+    return pygame.font.Font(None, size)
+
+
+def build_replay_argparser(include_csv_positional=True):
+    p = argparse.ArgumentParser(description='轨迹回放工具 - 驾驶者视角')
+    if include_csv_positional:
+        p.add_argument('csv_file', help='CSV数据文件路径')
+    p.add_argument('--host', default='127.0.0.1', help='CARLA服务器IP')
+    p.add_argument('-p', '--port', default=2000, type=int, help='CARLA服务器端口')
+    p.add_argument('--speed', default=1.0, type=float, help='回放速度倍率 (默认1.0)')
+    p.add_argument(
+        '--seek-step-pct',
+        default=1.0,
+        type=float,
+        help='进度跳转步长(占总帧百分比)。默认1%%，按←/→时生效',
+    )
+    p.add_argument(
+        '--seek-big-step-pct',
+        default=10.0,
+        type=float,
+        help='进度大步跳转(占总帧百分比)。默认10%%，按PgUp/PgDn时生效',
+    )
+    p.add_argument('--ego-vehicle', default='vehicle.audi.tt', help='自车蓝图')
+    p.add_argument('--lead-vehicle', default='vehicle.tesla.model3', help='前车蓝图')
+    p.add_argument('--loop', action='store_true', help='循环回放')
+    p.add_argument(
+        '--res',
+        default=None,
+        help='窗口分辨率 WxH（与主实验一致），指定时覆盖 --width/--height',
+    )
+    p.add_argument('--width', default=1280, type=int, help='窗口宽度')
+    p.add_argument('--height', default=720, type=int, help='窗口高度')
+    p.add_argument(
+        '--display',
+        default=0,
+        type=int,
+        help='显示器编号 (0,1,2…)，与 launch_all_views 多屏一致',
+    )
+    p.add_argument('--fullscreen', action='store_true', help='全屏（主实验同款）')
+    p.add_argument('--no-lead', action='store_true', help='不显示前车')
+    p.add_argument(
         '--snap-to-road',
         action='store_true',
         help='用 get_map().get_waypoint 将自车/前车 z 贴到路面（推荐有坡或桥时开启）',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--snap-z-offset',
         default=0.12,
         type=float,
         help='贴地后在路面高度上再抬高(米)，补偿车体原点与地面的间隙，默认 0.12',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--lead-z-offset',
         default=-0.07,
         type=float,
         help='仅前车：在贴地 z 上再叠加的偏移(米)，负值略压低、减轻漂浮感；默认 -0.06',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--no-z-smooth',
         action='store_true',
         help='关闭 z 指数平滑（默认开启；仅在与 --snap-to-road 一起用时有效）',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--z-smooth-alpha',
         default=0.2,
         type=float,
         help='z 平滑系数 0~1，越大越跟原始贴地高度、抖动可能更明显；越小越稳但略有滞后，默认 0.2',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--z-smooth-max-step',
         default=0.06,
         type=float,
         help='与 --snap-to-road 联用时，每帧平滑后 z 相对上一帧最大变化(米)，抑制尖峰；0 表示不限幅，默认 0.06',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--vehicle-physics',
         action='store_true',
         help='保留车辆物理模拟。默认关闭：每帧 set_transform 时物理/悬挂易与贴地 z 打架导致画面抖动',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--keep-world-weather',
         action='store_true',
         help='不修改天气。默认否则套用 --replay-weather（默认 ClearNoon）',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--replay-weather',
         default='ClearNoon',
         metavar='NAME',
@@ -523,7 +593,7 @@ def main():
             '黄昏: ClearSunset, CloudySunset, WetSunset, WetCloudySunset, SoftRainSunset, MidRainSunset, HardRainSunset'
         ),
     )
-    argparser.add_argument(
+    p.add_argument(
         '--replay-sun-overhead-forward',
         action='store_true',
         help=(
@@ -531,32 +601,46 @@ def main():
             '需未使用 --keep-world-weather。无法完全关闭引擎阴影，仅尽量减弱侧向长影'
         ),
     )
-    argparser.add_argument(
+    p.add_argument(
         '--replay-sun-altitude-deg',
         default=89.0,
         type=float,
         help='与 --replay-sun-overhead-forward 联用：太阳高度角 0~90，默认 89（近天顶）',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--replay-sun-yaw-offset-deg',
         default=0.0,
         type=float,
         help='方位角 = 自车 yaw + 本偏移；光影方向反了可试 180 或 ±90',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--gamma',
         default=2.2,
         type=float,
         help='主视角 RGB 相机 gamma，与 car_following_experiment.py --gamma 一致；默认 2.2',
     )
-    argparser.add_argument(
+    p.add_argument(
         '--replay-session-log',
         default=None,
         metavar='PATH',
         help='记录回放开始/结束时间的 JSON；默认与 CSV 同目录 <stem>_replay_session.json',
     )
-    args = argparser.parse_args()
+    p.add_argument(
+        '--pre-start-countdown-s',
+        default=10.0,
+        type=float,
+        help='正式回放前在起始帧上全屏倒计时（秒），0 关闭；默认 5',
+    )
+    p.add_argument(
+        '--playback-start-sim-offset-s',
+        default=60.0,
+        type=float,
+        help='从 CSV 首帧时间戳起算的 sim 时间（秒）达到该值后才开始播，默认 60（1 分钟）',
+    )
+    return p
 
+
+def validate_replay_args(args, argparser):
     if args.res:
         try:
             args.width, args.height = [int(x) for x in args.res.split('x')]
@@ -579,7 +663,373 @@ def main():
             f'--replay-weather 无效: {args.replay_weather!r}。'
             f' 可用预设示例: {preview}{more}'
         )
-    
+    if getattr(args, 'pre_start_countdown_s', 0.0) < 0:
+        argparser.error('--pre-start-countdown-s 不能为负')
+    if getattr(args, 'playback_start_sim_offset_s', 0.0) < 0:
+        argparser.error('--playback-start-sim-offset-s 不能为负')
+
+
+def validate_z_smooth_args(args, argparser, use_z_smooth):
+    if args.z_smooth_alpha <= 0 or args.z_smooth_alpha > 1:
+        argparser.error('--z-smooth-alpha 应在 (0, 1] 内')
+    if args.z_smooth_max_step < 0:
+        argparser.error('--z-smooth-max-step 不能为负')
+
+
+def destroy_replay_actors(camera, ego_vehicle, lead_vehicle):
+    if camera is not None:
+        try:
+            camera.destroy()
+        except Exception:
+            pass
+    if ego_vehicle is not None:
+        try:
+            ego_vehicle.destroy()
+        except Exception:
+            pass
+    if lead_vehicle is not None:
+        try:
+            lead_vehicle.destroy()
+        except Exception:
+            pass
+
+
+def spawn_replay_vehicles_and_camera(world, args, road_z, trajectory, has_lead):
+    """生成 hero / lead_vehicle 与主视角相机（与 main 中逻辑一致）。"""
+    bp_library = world.get_blueprint_library()
+    ego_bp = bp_library.find(args.ego_vehicle)
+    ego_bp.set_attribute('role_name', 'hero')
+    if ego_bp.has_attribute('color'):
+        ego_bp.set_attribute('color', '255,255,255')
+    start = trajectory[0]
+    z0_ego = road_z(start['ego_x'], start['ego_y'])
+    ego_spawn = carla.Transform(
+        carla.Location(x=start['ego_x'], y=start['ego_y'], z=z0_ego),
+        carla.Rotation(yaw=start['ego_yaw'] if start['ego_yaw'] else 0),
+    )
+    ego_vehicle = world.spawn_actor(ego_bp, ego_spawn)
+    lead_vehicle = None
+    if has_lead:
+        lead_bp = bp_library.find(args.lead_vehicle)
+        lead_bp.set_attribute('role_name', 'lead_vehicle')
+        if lead_bp.has_attribute('color'):
+            lead_bp.set_attribute('color', '0,0,255')
+        z0_lead = road_z(start['lead_x'], start['lead_y']) + args.lead_z_offset
+        lead_spawn = carla.Transform(
+            carla.Location(x=start['lead_x'], y=start['lead_y'], z=z0_lead),
+            carla.Rotation(yaw=start['lead_yaw'] if start['lead_yaw'] else 0),
+        )
+        lead_vehicle = world.spawn_actor(lead_bp, lead_spawn)
+    if not args.vehicle_physics:
+        for v in (ego_vehicle, lead_vehicle):
+            if v is None:
+                continue
+            try:
+                v.set_simulate_physics(False)
+            except Exception:
+                pass
+    camera = DriverCamera(
+        world, ego_vehicle, args.width, args.height, gamma=args.gamma
+    )
+    for _ in range(10):
+        world.tick()
+    return ego_vehicle, lead_vehicle, camera
+
+
+def play_trajectory_once(
+    *,
+    args,
+    world,
+    ego_vehicle,
+    lead_vehicle,
+    camera,
+    display,
+    clock,
+    trajectory,
+    font_mono,
+    font_mono_speed,
+    font_title,
+    font_countdown,
+    road_z,
+    use_z_smooth,
+    ego_z_smoother,
+    lead_z_smoother,
+    session_log,
+    session_log_path,
+    playback_cycle_index,
+    hold_first_frame_s=0.0,
+    hold_extra_lines=None,
+    session_mode_tag='L4',
+    playback_start_sim_offset_s=0.0,
+):
+    """
+    播放单条 trajectory 一次（不含外层 loop 与结束后等待）。
+    返回 running：若用户 ESC/关闭窗口则为 False。
+    """
+    running = True
+    paused = False
+    speed_mult = args.speed
+    play_start_ts = trajectory[0]['timestamp']
+    last_applied_idx = [None]
+
+    sun_tune = bool(args.replay_sun_overhead_forward)
+    sun_alt = float(args.replay_sun_altitude_deg)
+    sun_yaw_off = float(args.replay_sun_yaw_offset_deg)
+
+    def maybe_replay_sun(i):
+        if not sun_tune:
+            return
+        pt = trajectory[i]
+        y = pt.get('ego_yaw')
+        sync_replay_sun(world, sun_alt, y if y is not None else 0.0, sun_yaw_off)
+
+    exp_start_m = time.monotonic()
+    exp_wall_s = time.time()
+    now_utc = datetime.now(timezone.utc)
+    exp_start_utc = now_utc.isoformat()
+    if playback_cycle_index == 0:
+        sid = make_session_filter_id(now_utc, args.csv_file, session_mode_tag)
+        session_log['session_id'] = sid
+        print('')
+        print('========== 会话标识（检索用 / JSON 字段 session_id）==========')
+        print(f'  session_id:           {sid}')
+        print(f'  experiment_start_utc: {exp_start_utc}')
+        print('==============================================================')
+        print('')
+    cycle_rec = {
+        'playback_cycle_index': playback_cycle_index,
+        'experiment_start_utc': exp_start_utc,
+        'experiment_start_monotonic_s': exp_start_m,
+        'experiment_start_wall_time_s': exp_wall_s,
+    }
+    session_log['cycles'].append(cycle_rec)
+    session_log['playback_cycle_index'] = playback_cycle_index
+    session_log['experiment_start_utc'] = exp_start_utc
+    session_log['experiment_start_monotonic_s'] = exp_start_m
+    session_log['experiment_start_wall_time_s'] = exp_wall_s
+    _write_replay_session_log(session_log_path, session_log)
+    seek_step_frames = max(1, int(len(trajectory) * (args.seek_step_pct / 100.0)))
+    seek_big_step_frames = max(1, int(len(trajectory) * (args.seek_big_step_pct / 100.0)))
+
+    start_idx = resolve_playback_start_frame_index(
+        trajectory, play_start_ts, playback_start_sim_offset_s
+    )
+    if start_idx > 0:
+        sim0 = trajectory[start_idx]['timestamp'] - play_start_ts
+        print(
+            f'回放起点: sim_time≥{playback_start_sim_offset_s}s 的首帧 index={start_idx} '
+            f'(该帧 sim_time={sim0:.2f}s)'
+        )
+
+    def apply_frame(idx):
+        p = trajectory[idx]
+        if use_z_smooth:
+            if last_applied_idx[0] is None or abs(idx - last_applied_idx[0]) != 1:
+                ego_z_smoother.reset()
+                lead_z_smoother.reset()
+            last_applied_idx[0] = idx
+            z_ego = ego_z_smoother.smooth(road_z(p['ego_x'], p['ego_y']))
+        else:
+            z_ego = road_z(p['ego_x'], p['ego_y'])
+
+        ego_transform = carla.Transform(
+            carla.Location(x=p['ego_x'], y=p['ego_y'], z=z_ego),
+            carla.Rotation(yaw=p['ego_yaw'] if p['ego_yaw'] else 0),
+        )
+        ego_vehicle.set_transform(ego_transform)
+        if not args.vehicle_physics:
+            _stabilize_kinematic_vehicle_visuals(ego_vehicle)
+
+        if args.vehicle_physics and p['ego_speed'] > 0 and p['ego_yaw'] is not None:
+            rad = math.radians(p['ego_yaw'])
+            ego_velocity = carla.Vector3D(
+                x=p['ego_speed'] * math.cos(rad),
+                y=p['ego_speed'] * math.sin(rad),
+                z=0,
+            )
+            ego_vehicle.set_target_velocity(ego_velocity)
+
+        if lead_vehicle and p.get('lead_x') is not None:
+            if use_z_smooth:
+                z_lead = lead_z_smoother.smooth(road_z(p['lead_x'], p['lead_y'])) + args.lead_z_offset
+            else:
+                z_lead = road_z(p['lead_x'], p['lead_y']) + args.lead_z_offset
+            lead_transform = carla.Transform(
+                carla.Location(x=p['lead_x'], y=p['lead_y'], z=z_lead),
+                carla.Rotation(yaw=p['lead_yaw'] if p.get('lead_yaw') else 0),
+            )
+            lead_vehicle.set_transform(lead_transform)
+            if not args.vehicle_physics:
+                _stabilize_kinematic_vehicle_visuals(lead_vehicle)
+
+            lead_speed = p.get('lead_speed', 0)
+            if args.vehicle_physics and lead_speed > 0 and p.get('lead_yaw') is not None:
+                rad = math.radians(p['lead_yaw'])
+                lead_velocity = carla.Vector3D(
+                    x=lead_speed * math.cos(rad),
+                    y=lead_speed * math.sin(rad),
+                    z=0,
+                )
+                lead_vehicle.set_target_velocity(lead_velocity)
+
+        maybe_replay_sun(idx)
+
+    dw, dh = display.get_size()
+    if hold_first_frame_s > 0:
+        t_hold_end = time.time() + float(hold_first_frame_s)
+        while time.time() < t_hold_end and running:
+            remaining = max(0.0, t_hold_end - time.time())
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
+            if not running:
+                break
+            apply_frame(start_idx)
+            world.tick()
+            camera.render(display)
+            draw_hud(
+                display,
+                trajectory[start_idx],
+                (dw, dh),
+                font_mono,
+                font_mono_speed,
+                font_title,
+            )
+            lines = [f'倒计时: {_fmt_mm_ss(remaining)}']
+            if hold_extra_lines:
+                lines.extend(hold_extra_lines)
+            draw_center_countdown_lines(display, font_countdown, lines, dw, dh)
+            pygame.display.flip()
+            clock.tick(30)
+        if not running:
+            return False
+
+    cur_sim0 = trajectory[start_idx]['timestamp'] - play_start_ts
+    wall_start = time.time() - (cur_sim0 / speed_mult)
+    frame_idx = start_idx
+
+    while frame_idx < len(trajectory) and running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    paused = not paused
+                    print('暂停' if paused else '继续')
+                    if not paused:
+                        cur = trajectory[frame_idx]
+                        cur_sim = cur['timestamp'] - play_start_ts
+                        wall_start = time.time() - (cur_sim / speed_mult)
+                elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
+                    speed_mult = min(10.0, speed_mult + 0.5)
+                    print(f'速度: {speed_mult}x')
+                    cur = trajectory[frame_idx]
+                    cur_sim = cur['timestamp'] - play_start_ts
+                    wall_start = time.time() - (cur_sim / speed_mult)
+                elif event.key == pygame.K_MINUS:
+                    speed_mult = max(0.1, speed_mult - 0.5)
+                    print(f'速度: {speed_mult}x')
+                    cur = trajectory[frame_idx]
+                    cur_sim = cur['timestamp'] - play_start_ts
+                    wall_start = time.time() - (cur_sim / speed_mult)
+                elif event.key == pygame.K_RIGHT:
+                    new_idx = min(len(trajectory) - 1, frame_idx + seek_step_frames)
+                    if new_idx != frame_idx:
+                        frame_idx = new_idx
+                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        wall_start = time.time() - (cur_sim / speed_mult)
+                        print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
+                        if paused:
+                            apply_frame(frame_idx)
+                            world.tick()
+                elif event.key == pygame.K_LEFT:
+                    new_idx = max(0, frame_idx - seek_step_frames)
+                    if new_idx != frame_idx:
+                        frame_idx = new_idx
+                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        wall_start = time.time() - (cur_sim / speed_mult)
+                        print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
+                        if paused:
+                            apply_frame(frame_idx)
+                            world.tick()
+                elif event.key == pygame.K_PAGEUP:
+                    new_idx = min(len(trajectory) - 1, frame_idx + seek_big_step_frames)
+                    if new_idx != frame_idx:
+                        frame_idx = new_idx
+                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        wall_start = time.time() - (cur_sim / speed_mult)
+                        print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
+                        if paused:
+                            apply_frame(frame_idx)
+                            world.tick()
+                elif event.key == pygame.K_PAGEDOWN:
+                    new_idx = max(0, frame_idx - seek_big_step_frames)
+                    if new_idx != frame_idx:
+                        frame_idx = new_idx
+                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        wall_start = time.time() - (cur_sim / speed_mult)
+                        print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
+                        if paused:
+                            apply_frame(frame_idx)
+                            world.tick()
+
+        if paused:
+            apply_frame(frame_idx)
+            world.tick()
+            camera.render(display)
+            draw_hud(
+                display,
+                trajectory[frame_idx],
+                display.get_size(),
+                font_mono,
+                font_mono_speed,
+                font_title,
+            )
+            pygame.display.flip()
+            clock.tick(30)
+            continue
+
+        point = trajectory[frame_idx]
+        sim_time = point['timestamp'] - play_start_ts
+        target_time = sim_time / speed_mult
+        while True:
+            elapsed = time.time() - wall_start
+            if target_time <= elapsed:
+                break
+            rem = target_time - elapsed
+            if rem > 0.05:
+                time.sleep(0.05)
+                world.tick()
+            else:
+                time.sleep(rem)
+
+        apply_frame(frame_idx)
+        world.tick()
+        camera.render(display)
+        draw_hud(
+            display,
+            point,
+            display.get_size(),
+            font_mono,
+            font_mono_speed,
+            font_title,
+        )
+        pygame.display.flip()
+        clock.tick(60)
+        frame_idx += 1
+
+    return running
+
+
+def main():
+    argparser = build_replay_argparser(include_csv_positional=True)
+    args = argparser.parse_args()
+    validate_replay_args(args, argparser)
+
     # 加载轨迹
     print(f"加载轨迹: {args.csv_file}")
     trajectory = load_trajectory(args.csv_file)
@@ -656,14 +1106,10 @@ def main():
         fallback_z=0.5,
     )
     use_z_smooth = args.snap_to_road and not args.no_z_smooth
-    if args.z_smooth_alpha <= 0 or args.z_smooth_alpha > 1:
-        argparser.error('--z-smooth-alpha 应在 (0, 1] 内')
-    if args.z_smooth_max_step < 0:
-        argparser.error('--z-smooth-max-step 不能为负')
+    validate_z_smooth_args(args, argparser, use_z_smooth)
     z_max_step = args.z_smooth_max_step if use_z_smooth else 0.0
     ego_z_smoother = ZSmoother(args.z_smooth_alpha, max_step_m=z_max_step)
     lead_z_smoother = ZSmoother(args.z_smooth_alpha, max_step_m=z_max_step)
-    last_applied_idx = None
 
     if args.snap_to_road:
         print('贴地回放: 已启用 --snap-to-road (waypoint 对齐 z)')
@@ -685,319 +1131,85 @@ def main():
             world.tick()
     except Exception:
         pass
-    
-    # 生成车辆
-    bp_library = world.get_blueprint_library()
-    
-    # 自车 - 与主实验脚本一致
-    ego_bp = bp_library.find(args.ego_vehicle)
-    ego_bp.set_attribute('role_name', 'hero')
-    # 与 car_following_experiment.py 一致：白色车漆（Audi TT 等在车身上呈浅银观感）
-    if ego_bp.has_attribute('color'):
-        ego_bp.set_attribute('color', '255,255,255')
-    
-    start = trajectory[0]
-    z0_ego = road_z(start['ego_x'], start['ego_y'])
-    ego_spawn = carla.Transform(
-        carla.Location(x=start['ego_x'], y=start['ego_y'], z=z0_ego),
-        carla.Rotation(yaw=start['ego_yaw'] if start['ego_yaw'] else 0)
-    )
-    ego_vehicle = world.spawn_actor(ego_bp, ego_spawn)
-    print(f"自车已生成: {ego_vehicle.type_id}")
-    
-    # 前车 - 与主实验脚本一致 (Tesla Model 3, 蓝色)
-    lead_vehicle = None
-    if has_lead:
-        lead_bp = bp_library.find(args.lead_vehicle)
-        lead_bp.set_attribute('role_name', 'lead_vehicle')
-        if lead_bp.has_attribute('color'):
-            lead_bp.set_attribute('color', '0,0,255')  # 蓝色，与主脚本一致
-        z0_lead = road_z(start['lead_x'], start['lead_y']) + args.lead_z_offset
-        lead_spawn = carla.Transform(
-            carla.Location(x=start['lead_x'], y=start['lead_y'], z=z0_lead),
-            carla.Rotation(yaw=start['lead_yaw'] if start['lead_yaw'] else 0)
-        )
-        lead_vehicle = world.spawn_actor(lead_bp, lead_spawn)
-        print(f"前车已生成: {lead_vehicle.type_id}")
 
-    # 轨迹回放每帧 teleport：开着物理时悬挂/地面穿透会与 set_transform 打架，相机绑在车上会明显上下抖
-    if not args.vehicle_physics:
-        for v in (ego_vehicle, lead_vehicle):
-            if v is None:
-                continue
-            try:
-                v.set_simulate_physics(False)
-            except Exception:
-                pass
-        print('回放: 已关闭自车/前车物理（默认，减轻抖动）；需要真实车体动力学请加 --vehicle-physics')
-    
-    # 创建驾驶者视角摄像机
-    camera = DriverCamera(
-        world, ego_vehicle, args.width, args.height, gamma=args.gamma
+    ego_vehicle, lead_vehicle, camera = spawn_replay_vehicles_and_camera(
+        world, args, road_z, trajectory, has_lead
     )
-    
-    # 等待初始化
-    for _ in range(10):
-        world.tick()
-    
+    print(f'自车已生成: {ego_vehicle.type_id}')
+    if lead_vehicle:
+        print(f'前车已生成: {lead_vehicle.type_id}')
+    if not args.vehicle_physics:
+        print(
+            '回放: 已关闭自车/前车物理（默认，减轻抖动）；需要真实车体动力学请加 --vehicle-physics'
+        )
+
+    font_countdown = make_countdown_font()
+
     print(f"\n开始回放 (速度: {args.speed}x)")
-    print("按 ESC 退出, 空格键 暂停/继续, +/- 调整速度")
-    print("按 ←/→ 调整进度(默认1%%)，按 PgUp/PgDn 快速跳转(默认10%%)")
+    print('按 ESC 退出, 空格键 暂停/继续, +/- 调整速度')
+    print('按 ←/→ 调整进度(默认1%%)，按 PgUp/PgDn 快速跳转(默认10%%)')
     print(f'会话记录(JSON): {session_log_path}')
+    print(
+        f'正式回放前: {args.pre_start_countdown_s}s 中央倒计时（0=关闭）；'
+        f'从 sim_time≥{args.playback_start_sim_offset_s}s 的首帧起播'
+    )
+
+    sun_tune = bool(args.replay_sun_overhead_forward)
+    sun_alt = float(args.replay_sun_altitude_deg)
+    sun_yaw_off = float(args.replay_sun_yaw_offset_deg)
+    if sun_tune:
+        print(
+            f'回放: 太阳高度 {sun_alt}°（近天顶、短影）+ 方位角随自车 yaw，偏移 {sun_yaw_off}°'
+        )
 
     try:
         running = True
-        paused = False
-        speed_mult = args.speed
         playback_cycle_index = 0
-
-        play_start_ts = trajectory[0]['timestamp']
-
-        sun_tune = bool(args.replay_sun_overhead_forward)
-        sun_alt = float(args.replay_sun_altitude_deg)
-        sun_yaw_off = float(args.replay_sun_yaw_offset_deg)
-
-        def maybe_replay_sun(i):
-            if not sun_tune:
-                return
-            pt = trajectory[i]
-            y = pt.get('ego_yaw')
-            sync_replay_sun(world, sun_alt, y if y is not None else 0.0, sun_yaw_off)
-
-        if sun_tune:
-            print(
-                f'回放: 太阳高度 {sun_alt}°（近天顶、短影）+ 方位角随自车 yaw，偏移 {sun_yaw_off}°'
-            )
-
         while running:
-            wall_start = time.time()
-            frame_idx = 0
-            exp_start_m = time.monotonic()
-            exp_wall_s = time.time()
-            now_utc = datetime.now(timezone.utc)
-            exp_start_utc = now_utc.isoformat()
-            if playback_cycle_index == 0:
-                sid = make_session_filter_id(now_utc, args.csv_file, 'L4')
-                session_log['session_id'] = sid
-                print('')
-                print('========== 会话标识（检索用 / JSON 字段 session_id）==========')
-                print(f'  session_id:           {sid}')
-                print(f'  experiment_start_utc: {exp_start_utc}')
-                print('==============================================================')
-                print('')
-            cycle_rec = {
-                'playback_cycle_index': playback_cycle_index,
-                'experiment_start_utc': exp_start_utc,
-                'experiment_start_monotonic_s': exp_start_m,
-                'experiment_start_wall_time_s': exp_wall_s,
-            }
-            session_log['cycles'].append(cycle_rec)
-            session_log['playback_cycle_index'] = playback_cycle_index
-            session_log['experiment_start_utc'] = exp_start_utc
-            session_log['experiment_start_monotonic_s'] = exp_start_m
-            session_log['experiment_start_wall_time_s'] = exp_wall_s
-            _write_replay_session_log(session_log_path, session_log)
-            seek_step_frames = max(1, int(len(trajectory) * (args.seek_step_pct / 100.0)))
-            seek_big_step_frames = max(1, int(len(trajectory) * (args.seek_big_step_pct / 100.0)))
-
-            def apply_frame(idx):
-                """将 CSV 中 idx 对应的帧状态应用到 CARLA 实体（不包含 world.tick）。"""
-                nonlocal last_applied_idx
-                p = trajectory[idx]
-                if use_z_smooth:
-                    if last_applied_idx is None or abs(idx - last_applied_idx) != 1:
-                        ego_z_smoother.reset()
-                        lead_z_smoother.reset()
-                    last_applied_idx = idx
-                    z_ego = ego_z_smoother.smooth(road_z(p['ego_x'], p['ego_y']))
-                else:
-                    z_ego = road_z(p['ego_x'], p['ego_y'])
-
-                # 自车变换
-                ego_transform = carla.Transform(
-                    carla.Location(x=p['ego_x'], y=p['ego_y'], z=z_ego),
-                    carla.Rotation(yaw=p['ego_yaw'] if p['ego_yaw'] else 0)
-                )
-                ego_vehicle.set_transform(ego_transform)
-                if not args.vehicle_physics:
-                    _stabilize_kinematic_vehicle_visuals(ego_vehicle)
-
-                # 仅在开启车辆物理时设速度；运动学模式下由 transform 完全决定位姿，避免与物理求解冲突
-                if args.vehicle_physics and p['ego_speed'] > 0 and p['ego_yaw'] is not None:
-                    rad = math.radians(p['ego_yaw'])
-                    ego_velocity = carla.Vector3D(
-                        x=p['ego_speed'] * math.cos(rad),
-                        y=p['ego_speed'] * math.sin(rad),
-                        z=0
-                    )
-                    ego_vehicle.set_target_velocity(ego_velocity)
-
-                # 前车变换与速度
-                if lead_vehicle and p.get('lead_x') is not None:
-                    if use_z_smooth:
-                        z_lead = lead_z_smoother.smooth(road_z(p['lead_x'], p['lead_y'])) + args.lead_z_offset
-                    else:
-                        z_lead = road_z(p['lead_x'], p['lead_y']) + args.lead_z_offset
-                    lead_transform = carla.Transform(
-                        carla.Location(x=p['lead_x'], y=p['lead_y'], z=z_lead),
-                        carla.Rotation(yaw=p['lead_yaw'] if p.get('lead_yaw') else 0)
-                    )
-                    lead_vehicle.set_transform(lead_transform)
-                    if not args.vehicle_physics:
-                        _stabilize_kinematic_vehicle_visuals(lead_vehicle)
-
-                    lead_speed = p.get('lead_speed', 0)
-                    if args.vehicle_physics and lead_speed > 0 and p.get('lead_yaw') is not None:
-                        rad = math.radians(p['lead_yaw'])
-                        lead_velocity = carla.Vector3D(
-                            x=lead_speed * math.cos(rad),
-                            y=lead_speed * math.sin(rad),
-                            z=0
-                        )
-                        lead_vehicle.set_target_velocity(lead_velocity)
-
-                maybe_replay_sun(idx)
-            
-            while frame_idx < len(trajectory) and running:
-                # 事件处理
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
-                    elif event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_ESCAPE:
-                            running = False
-                        elif event.key == pygame.K_SPACE:
-                            paused = not paused
-                            print("暂停" if paused else "继续")
-                            if not paused:
-                                # 维持“暂停=冻结时间”的体验：对齐当前帧的目标时间
-                                cur = trajectory[frame_idx]
-                                cur_sim = cur['timestamp'] - play_start_ts
-                                wall_start = time.time() - (cur_sim / speed_mult)
-                        elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
-                            speed_mult = min(10.0, speed_mult + 0.5)
-                            print(f"速度: {speed_mult}x")
-                            # 对齐当前帧时间，避免改速后跳帧
-                            cur = trajectory[frame_idx]
-                            cur_sim = cur['timestamp'] - play_start_ts
-                            wall_start = time.time() - (cur_sim / speed_mult)
-                        elif event.key == pygame.K_MINUS:
-                            speed_mult = max(0.1, speed_mult - 0.5)
-                            print(f"速度: {speed_mult}x")
-                            cur = trajectory[frame_idx]
-                            cur_sim = cur['timestamp'] - play_start_ts
-                            wall_start = time.time() - (cur_sim / speed_mult)
-                        elif event.key == pygame.K_RIGHT:
-                            new_idx = min(len(trajectory) - 1, frame_idx + seek_step_frames)
-                            if new_idx != frame_idx:
-                                frame_idx = new_idx
-                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
-                                wall_start = time.time() - (cur_sim / speed_mult)
-                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
-                                if paused:
-                                    apply_frame(frame_idx)
-                                    world.tick()
-                        elif event.key == pygame.K_LEFT:
-                            new_idx = max(0, frame_idx - seek_step_frames)
-                            if new_idx != frame_idx:
-                                frame_idx = new_idx
-                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
-                                wall_start = time.time() - (cur_sim / speed_mult)
-                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
-                                if paused:
-                                    apply_frame(frame_idx)
-                                    world.tick()
-                        elif event.key == pygame.K_PAGEUP:
-                            new_idx = min(len(trajectory) - 1, frame_idx + seek_big_step_frames)
-                            if new_idx != frame_idx:
-                                frame_idx = new_idx
-                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
-                                wall_start = time.time() - (cur_sim / speed_mult)
-                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
-                                if paused:
-                                    apply_frame(frame_idx)
-                                    world.tick()
-                        elif event.key == pygame.K_PAGEDOWN:
-                            new_idx = max(0, frame_idx - seek_big_step_frames)
-                            if new_idx != frame_idx:
-                                frame_idx = new_idx
-                                cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
-                                wall_start = time.time() - (cur_sim / speed_mult)
-                                print(f"Seek: {frame_idx + 1}/{len(trajectory)}")
-                                if paused:
-                                    apply_frame(frame_idx)
-                                    world.tick()
-                
-                if paused:
-                    # 同步模式下其它窗口 wait_for_tick：暂停也必须 tick，否则会全局卡住
-                    apply_frame(frame_idx)
-                    world.tick()
-                    camera.render(display)
-                    draw_hud(
-                        display,
-                        trajectory[frame_idx],
-                        display.get_size(),
-                        font_mono,
-                        font_mono_speed,
-                        font_title,
-                    )
-                    pygame.display.flip()
-                    clock.tick(30)
-                    continue
-                
-                point = trajectory[frame_idx]
-                
-                # 计算目标时间：CSV 时间戳间隔大时，不能长时间只 sleep 不 tick，
-                # 否则同步模式下侧视等进程卡在 wait_for_tick。
-                sim_time = point['timestamp'] - play_start_ts
-                target_time = sim_time / speed_mult
-                while True:
-                    elapsed = time.time() - wall_start
-                    if target_time <= elapsed:
-                        break
-                    rem = target_time - elapsed
-                    if rem > 0.05:
-                        time.sleep(0.05)
-                        world.tick()
-                    else:
-                        time.sleep(rem)
-
-                # 更新自车/前车状态（由 CSV 驱动）
-                apply_frame(frame_idx)
-                
-                # 更新世界
-                world.tick()
-                
-                # 渲染
-                camera.render(display)
-                draw_hud(
-                    display,
-                    point,
-                    display.get_size(),
-                    font_mono,
-                    font_mono_speed,
-                    font_title,
-                )
-                pygame.display.flip()
-                
-                clock.tick(60)
-                frame_idx += 1
-            
+            running = play_trajectory_once(
+                args=args,
+                world=world,
+                ego_vehicle=ego_vehicle,
+                lead_vehicle=lead_vehicle,
+                camera=camera,
+                display=display,
+                clock=clock,
+                trajectory=trajectory,
+                font_mono=font_mono,
+                font_mono_speed=font_mono_speed,
+                font_title=font_title,
+                font_countdown=font_countdown,
+                road_z=road_z,
+                use_z_smooth=use_z_smooth,
+                ego_z_smoother=ego_z_smoother,
+                lead_z_smoother=lead_z_smoother,
+                session_log=session_log,
+                session_log_path=session_log_path,
+                playback_cycle_index=playback_cycle_index,
+                hold_first_frame_s=float(args.pre_start_countdown_s),
+                hold_extra_lines=None,
+                session_mode_tag='L4',
+                playback_start_sim_offset_s=float(args.playback_start_sim_offset_s),
+            )
+            if not running:
+                break
             if not args.loop:
-                print("\n回放完成")
-                # 等待用户按键退出
+                print('\n回放完成')
                 while running:
                     world.tick()
                     for event in pygame.event.get():
-                        if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                        if event.type == pygame.QUIT or (
+                            event.type == pygame.KEYDOWN
+                            and event.key == pygame.K_ESCAPE
+                        ):
                             running = False
                     clock.tick(30)
-            else:
-                print("\n循环回放...")
-                playback_cycle_index += 1
+                break
+            print('\n循环回放...')
+            playback_cycle_index += 1
 
     except KeyboardInterrupt:
-        print("\n用户中断")
+        print('\n用户中断')
 
     finally:
         session_log['session_end_utc'] = datetime.now(timezone.utc).isoformat()

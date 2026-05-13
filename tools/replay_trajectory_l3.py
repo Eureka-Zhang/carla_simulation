@@ -5,7 +5,7 @@ L3 轨迹回放（心理接管提示）
 
 与 tools/replay_trajectory.py（L4 全自动回放）并列：车辆运动仍完全由 CSV 驱动，不改变 CARLA 控制。
 空格键触发「接管」心理预期：播放 audio/takeover.mp3，HUD 显示接管状态约 1.5s 后自动回到自动驾驶提示。
-右侧栏显示与主实验类似的更多驾驶量（CSV 有则显示，无则 --）。
+左侧栏：行车信息与驾驶量区块标题按原规则居中；「--- L3 状态 ---」居中；「驾驶状态」标签与「自动驾驶/接管提示中」大号字左对齐；提示剩余与油门/制动/方向左对齐（CSV 有则显示，无则 --）。
 
 暂停请按 P（避免与空格接管冲突）。
 
@@ -147,27 +147,34 @@ def load_trajectory_l3(csv_file):
     return trajectory
 
 
-def draw_hud_l3_right(
+def draw_hud_l3(
     display,
     point,
     display_size,
     font_mono,
+    font_mono_speed,
     font_title,
     takeover_until_monotonic,
 ):
-    """右侧半透明栏：驾驶量 + L3 接管状态。"""
-    dw, dh = display_size
-    panel_w = min(420, dw // 3)
-    x0 = max(8, dw - panel_w - 10)
+    """左侧栏：行车信息标题居中；「--- L3 状态 ---」居中；驾驶状态与自动驾驶/接管提示中左对齐；驾驶量标题居中。"""
+    dh = display_size[1]
+    panel_w = 420
+    px_left = 8
+    base_bottom = rt.draw_hud(
+        display,
+        point,
+        display_size,
+        font_mono,
+        font_mono_speed,
+        font_title,
+    )
 
-    panel = pygame.Surface((panel_w, dh))
-    panel.set_alpha(100)
-    panel.fill((0, 0, 0))
-    display.blit(panel, (x0, 0))
+    def blit_cx(surf, y):
+        x = max(0, (panel_w - surf.get_width()) // 2)
+        display.blit(surf, (x, y))
 
-    px = x0 + 8
-    py = 12
-    line_h = 20
+    py = base_bottom + 14
+    line_h = 22
 
     now_m = time.monotonic()
     in_takeover = takeover_until_monotonic > now_m
@@ -177,44 +184,39 @@ def draw_hud_l3_right(
     color_mode = (255, 220, 120) if in_takeover else (180, 220, 255)
 
     title = font_title.render('--- L3 状态 ---', True, (220, 225, 230))
-    display.blit(title, (px, py))
-    py += title.get_height() + 6
+    blit_cx(title, py)
+    py += title.get_height() + 10
 
-    m1 = font_title.render(f'驾驶模式: {mode_line}', True, color_mode)
-    display.blit(m1, (px, py))
-    py += line_h + 4
+    sub_lbl = font_mono.render('驾驶状态', True, (190, 195, 200))
+    display.blit(sub_lbl, (px_left, py))
+    py += sub_lbl.get_height() + 6
+
+    mode_big = font_mono_speed.render(mode_line, True, color_mode)
+    display.blit(mode_big, (px_left, py))
+    py += mode_big.get_height() + 10
 
     if in_takeover:
         m2 = font_mono.render(f'提示剩余: {remain:.1f} s', True, (255, 255, 255))
-        display.blit(m2, (px, py))
-        py += line_h + 8
+        display.blit(m2, (px_left, py))
+        py += m2.get_height() + 12
     else:
-        py += 8
+        py += 6
 
-    sep = font_mono.render('--- 驾驶量(CSV) ---', True, (160, 170, 180))
-    display.blit(sep, (px, py))
-    py += line_h + 4
+    sep = font_mono.render('--- 驾驶量 ---', True, (160, 170, 180))
+    blit_cx(sep, py)
+    py += sep.get_height() + 8
 
-    loc_x = point['ego_x']
-    loc_y = point['ego_y']
     lines = [
-        f'位置: ({loc_x:7.1f}, {loc_y:7.1f})',
         f'油门: {_fmt_opt(point.get("throttle"), ".3f")}',
         f'制动: {_fmt_opt(point.get("brake"), ".3f")}',
         f'方向: {_fmt_opt(point.get("steer"), ".3f")}',
-        f'自车加速度: {_fmt_opt(point.get("ego_acceleration"), ".2f")} m/s²',
-        f'加速度变化率: {_fmt_opt(point.get("ego_jerk"), ".3f")}',
-        f'前车加速度: {_fmt_opt(point.get("lead_acceleration"), ".2f")} m/s²',
-        f'时间车头距: {_fmt_opt(point.get("time_headway"), ".2f")} s',
-        f'相对速度: {_fmt_opt(point.get("relative_speed"), ".2f")} m/s',
-        f'TTC: {_fmt_opt(point.get("ttc"), ".2f")} s',
     ]
 
     for line in lines:
         if py > dh - line_h:
             break
         surf = font_mono.render(line, True, (235, 238, 242))
-        display.blit(surf, (px, py))
+        display.blit(surf, (px_left, py))
         py += line_h
 
 
@@ -312,6 +314,18 @@ def build_arg_parser():
         metavar='PATH',
         help='记录实验开始时间与空格按键的 JSON；默认与 CSV 同目录 <stem>_l3_events.json',
     )
+    p.add_argument(
+        '--pre-start-countdown-s',
+        default=10.0,
+        type=float,
+        help='正式回放前在起始帧上全屏倒计时（秒），0 关闭；默认 5',
+    )
+    p.add_argument(
+        '--playback-start-sim-offset-s',
+        default=60.0,
+        type=float,
+        help='从 CSV 首帧起算的 sim 时间（秒）达到该值后才开始播，默认 60（1 分钟）',
+    )
     return p
 
 
@@ -341,6 +355,10 @@ def main():
         )
     if args.takeover_duration_s <= 0:
         argparser.error('--takeover-duration-s 应为正数')
+    if args.pre_start_countdown_s < 0:
+        argparser.error('--pre-start-countdown-s 不能为负')
+    if args.playback_start_sim_offset_s < 0:
+        argparser.error('--playback-start-sim-offset-s 不能为负')
 
     print(f'加载轨迹: {args.csv_file}')
     trajectory = load_trajectory_l3(args.csv_file)
@@ -376,6 +394,7 @@ def main():
     pygame.font.init()
     pygame.mixer.init()
     font_mono, font_mono_speed, font_title = rt.make_replay_hud_fonts()
+    font_countdown = rt.make_countdown_font()
 
     display_flags = pygame.HWSURFACE | pygame.DOUBLEBUF
     if args.fullscreen:
@@ -481,6 +500,10 @@ def main():
     print('空格: 心理接管提示  |  P: 暂停/继续  |  +/- 速度  |  ←/→ PgUp/Dn 跳转')
     print(f'接管提示时长: {args.takeover_duration_s}s，音频: {args.takeover_audio}')
     print(f'事件记录(JSON): {l3_log_path}')
+    print(
+        f'正式回放前: {args.pre_start_countdown_s}s 中央倒计时（0=关闭）；'
+        f'从 sim_time≥{args.playback_start_sim_offset_s}s 的首帧起播'
+    )
 
     takeover_until_m = 0.0
 
@@ -503,8 +526,6 @@ def main():
             rt.sync_replay_sun(world, sun_alt, y if y is not None else 0.0, sun_yaw_off)
 
         while running:
-            wall_start = time.time()
-            frame_idx = 0
             exp_start_m = time.monotonic()
             exp_wall_s = time.time()
             now_utc = datetime.now(timezone.utc)
@@ -608,23 +629,61 @@ def main():
                 apply_frame(point_idx)
                 world.tick()
                 camera.render(display)
-                rt.draw_hud(
+                draw_hud_l3(
                     display,
                     trajectory[point_idx],
                     display.get_size(),
                     font_mono,
                     font_mono_speed,
                     font_title,
-                )
-                draw_hud_l3_right(
-                    display,
-                    trajectory[point_idx],
-                    display.get_size(),
-                    font_mono,
-                    font_title,
                     takeover_until_m,
                 )
                 pygame.display.flip()
+
+            start_idx = rt.resolve_playback_start_frame_index(
+                trajectory, play_start_ts, float(args.playback_start_sim_offset_s)
+            )
+            if start_idx > 0:
+                sim0 = trajectory[start_idx]['timestamp'] - play_start_ts
+                print(
+                    f'回放起点: sim_time≥{args.playback_start_sim_offset_s}s 的首帧 index={start_idx} '
+                    f'(该帧 sim_time={sim0:.2f}s)'
+                )
+            dw_cd, dh_cd = display.get_size()
+            if float(args.pre_start_countdown_s) > 0:
+                t_hold_end = time.time() + float(args.pre_start_countdown_s)
+                while time.time() < t_hold_end and running:
+                    remaining = max(0.0, t_hold_end - time.time())
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            running = False
+                        elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                            running = False
+                    if not running:
+                        break
+                    apply_frame(start_idx)
+                    world.tick()
+                    camera.render(display)
+                    draw_hud_l3(
+                        display,
+                        trajectory[start_idx],
+                        (dw_cd, dh_cd),
+                        font_mono,
+                        font_mono_speed,
+                        font_title,
+                        takeover_until_m,
+                    )
+                    lines = [f'倒计时: {rt._fmt_mm_ss(remaining)}']
+                    rt.draw_center_countdown_lines(
+                        display, font_countdown, lines, dw_cd, dh_cd
+                    )
+                    pygame.display.flip()
+                    clock.tick(30)
+            if not running:
+                break
+            cur_sim0 = trajectory[start_idx]['timestamp'] - play_start_ts
+            wall_start = time.time() - (cur_sim0 / speed_mult)
+            frame_idx = start_idx
 
             while frame_idx < len(trajectory) and running:
                 for event in pygame.event.get():
@@ -723,19 +782,12 @@ def main():
                     apply_frame(frame_idx)
                     world.tick()
                     camera.render(display)
-                    rt.draw_hud(
+                    draw_hud_l3(
                         display,
                         trajectory[frame_idx],
                         display.get_size(),
                         font_mono,
                         font_mono_speed,
-                        font_title,
-                    )
-                    draw_hud_l3_right(
-                        display,
-                        trajectory[frame_idx],
-                        display.get_size(),
-                        font_mono,
                         font_title,
                         takeover_until_m,
                     )
@@ -760,19 +812,12 @@ def main():
                 apply_frame(frame_idx)
                 world.tick()
                 camera.render(display)
-                rt.draw_hud(
+                draw_hud_l3(
                     display,
                     point,
                     display.get_size(),
                     font_mono,
                     font_mono_speed,
-                    font_title,
-                )
-                draw_hud_l3_right(
-                    display,
-                    point,
-                    display.get_size(),
-                    font_mono,
                     font_title,
                     takeover_until_m,
                 )
