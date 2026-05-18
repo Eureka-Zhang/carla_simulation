@@ -8,9 +8,10 @@
 用法:
     python replay_trajectory.py <csv_file> [options]
 
-多屏与正常驾驶一致：自车 role_name=hero，侧视/后视等相机脚本会附着同一辆车。
+可多屏与正常驾驶一致：自车 role_name=hero，侧视/后视等相机脚本会附着同一辆车。
 可先启动本脚本再启动 cameras/*.py，或直接使用项目根目录的 launch_replay_all_views.ps1。
 加 --snap-to-road 时按地图 waypoint 对齐路面高度（坡道观感更好）；默认对贴地 z 做平滑+限幅。默认关闭车辆物理，减轻每帧 teleport 与悬挂/地面求解冲突导致的相机抖动；需要真实车体动力学时加 --vehicle-physics。默认天气 ClearNoon；可用 --replay-weather 换 CARLA 内置预设（如 WetNoon、ClearSunset）。可加 --replay-sun-overhead-forward 使太阳近天顶（短影）并按自车航向每帧调方位角。主相机 gamma 默认 2.2（见 --gamma）。保留服务器天气请加 --keep-world-weather。
+默认按仿真轴截取 [60, 120]s 再回放（闭区间）；仿真轴优先 sim_time_s。墙钟节拍：若首帧有 sim_time_s 则用各行 sim_time_s 相对首行 sim_time_s，否则退回 timestamp−首行。
 
 示例:
     python replay_trajectory.py ../experiment_data/20260302_032032/driving_data.csv
@@ -19,8 +20,8 @@
     python replay_trajectory.py data.csv --replay-weather WetNoon
     python replay_trajectory.py data.csv --replay-sun-overhead-forward --replay-sun-yaw-offset-deg 180
 
-回放开始与结束时间会写入与 CSV 同目录的 driving_data_replay_session.json（可用 --replay-session-log 指定）。
-JSON 文件头含 session_id（UTC 时间戳 + CSV 主文件名 + L4），便于检索。
+回放开始与结束时间会写入与 CSV 同目录的 JSON（文件名含上级文件夹名、被试文件夹名及系统时间戳，可用 --replay-session-log 指定）。
+experiment_*（墙钟）：自「赛前倒计时结束」起至本段回放结束；不含倒计时时长。JSON 含 session_id；时间为带时区的本机时间 ISO。
 """
 
 import glob
@@ -32,7 +33,7 @@ import csv
 import time
 import math
 import weakref
-from datetime import datetime, timezone
+from datetime import datetime
 
 # 添加CARLA路径
 try:
@@ -48,11 +49,43 @@ import pygame
 import numpy as np
 
 
+def _session_log_filename_stamp():
+    return datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+
+
+def _sanitize_filename_tag(s):
+    """目录名用作文件名片段：字母数字与 - _ 保留，其余替换为 _。"""
+    if not s:
+        return ''
+    return ''.join(c if (c.isalnum() or c in '-_') else '_' for c in s)
+
+
+def _csv_dir_parent_subject_tag(csv_abs_path):
+    """
+    CSV 所在目录视为被试文件夹，其父目录 basename 为上级文件夹名（与 overtaking 会话日志命名一致）。
+    返回拼接标签，如 phaseFolder_T1。
+    """
+    d = os.path.dirname(os.path.abspath(csv_abs_path))
+    leaf = _sanitize_filename_tag(os.path.basename(d.rstrip(os.sep)))
+    parent_dir = os.path.dirname(d)
+    parent_leaf = (
+        _sanitize_filename_tag(os.path.basename(parent_dir.rstrip(os.sep)))
+        if parent_dir
+        else ''
+    )
+    if parent_leaf and parent_leaf != leaf:
+        return f'{parent_leaf}_{leaf}'
+    return leaf or 'session'
+
+
 def _default_replay_session_log_path(csv_path):
-    d = os.path.dirname(os.path.abspath(csv_path))
-    base = os.path.basename(csv_path)
+    csv_abs = os.path.abspath(csv_path)
+    d = os.path.dirname(csv_abs)
+    base = os.path.basename(csv_abs)
     root, _ = os.path.splitext(base)
-    return os.path.join(d, f'{root}_replay_session.json')
+    tag = _csv_dir_parent_subject_tag(csv_abs)
+    stamp = _session_log_filename_stamp()
+    return os.path.join(d, f'{root}_replay_session_{tag}_{stamp}.json')
 
 
 def _write_replay_session_log(path, data):
@@ -65,13 +98,26 @@ def _write_replay_session_log(path, data):
     os.replace(tmp, path)
 
 
-def make_session_filter_id(utc_dt, csv_path, mode_tag):
+def session_clock_snapshot():
     """
-    UTC 时间戳 + CSV 主文件名 + 模式标签，写入 JSON 文件头 session_id，
-    便于按时间或数据源筛选（与 experiment_start_utc 同源时刻）。
+    会话 JSON 用时间戳：ts_system_local 为本机时区 ISO；
+    wall_time_s 为 POSIX epoch 秒；monotonic_s 为单调时钟秒（仅适合算间隔）。
+    """
+    local = datetime.now().astimezone()
+    return {
+        'ts_system_local': local.isoformat(timespec='microseconds'),
+        'wall_time_s': time.time(),
+        'monotonic_s': time.monotonic(),
+    }
+
+
+def make_session_filter_id(local_dt, csv_path, mode_tag):
+    """
+    本机时间戳 + CSV 主文件名 + 模式标签，写入 JSON 文件头 session_id。
+    local_dt 须为带时区的本地时间（与 experiment_start_system_local 同源时刻）。
     """
     stem = os.path.splitext(os.path.basename(csv_path))[0]
-    ts = utc_dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]
+    ts = local_dt.strftime('%Y%m%d_%H%M%S_%f')[:-3]
     return f'{ts}_{stem}_{mode_tag}'
 
 
@@ -253,6 +299,14 @@ def load_trajectory(csv_file):
                     point['lead_x'] - point['ego_x'],
                     point['lead_y'] - point['ego_y'],
                 )
+
+            if row.get('sim_time_s') not in (None, ''):
+                try:
+                    point['sim_time_s'] = float(row['sim_time_s'])
+                except (TypeError, ValueError):
+                    point['sim_time_s'] = None
+            else:
+                point['sim_time_s'] = None
 
             trajectory.append(point)
             
@@ -457,10 +511,40 @@ def _fmt_mm_ss(seconds):
     return f'{mm:02d}:{ss:02d}'
 
 
+def playback_elapsed_sim_s(pt, traj_first_ts, traj_first_pt):
+    """
+    本段回放墙钟节拍用的「相对首采样」仿真秒 elapsed。
+    若首采样点带有 sim_time_s 且当前点也有则用 sim 差值；否则用 timestamp−首行 timestamp。
+    """
+    if traj_first_pt.get('sim_time_s') is not None and pt.get('sim_time_s') is not None:
+        return float(pt['sim_time_s']) - float(traj_first_pt['sim_time_s'])
+    return float(pt['timestamp']) - float(traj_first_ts)
+
+
+def playback_absolute_sim_s(pt, traj_first_ts):
+    """
+    转向灯/相位等「绝对仿真秒」刻度：优先 sim_time_s 列（与 CSV 相位表一致）；否则 timestamp−首行 timestamp。
+    """
+    v = pt.get('sim_time_s')
+    if v is not None:
+        return float(v)
+    return float(pt['timestamp']) - float(traj_first_ts)
+
+
+def trajectory_point_sim_axis_s(pt, anchor_ts):
+    """
+    截取/起点索引用仿真时间坐标：优先 CSV 列 sim_time_s；缺省为 timestamp-anchor_ts。
+    """
+    v = pt.get('sim_time_s')
+    if v is not None:
+        return float(v)
+    return float(pt['timestamp']) - float(anchor_ts)
+
+
 def resolve_playback_start_frame_index(trajectory, play_start_ts, sim_offset_s):
     """
-    首帧满足 sim_time >= sim_offset_s 的帧索引（sim_time = timestamp - play_start_ts）。
-    sim_offset_s <= 0 时返回 0；若无帧达到阈值则返回最后一帧索引。
+    首帧满足仿真轴时间 >= sim_offset_s 的索引。
+    若点含 sim_time_s 则用该列，否则 sim = timestamp - play_start_ts。
     """
     if not trajectory:
         return 0
@@ -468,9 +552,33 @@ def resolve_playback_start_frame_index(trajectory, play_start_ts, sim_offset_s):
     if target <= 0.0:
         return 0
     for i, pt in enumerate(trajectory):
-        if pt['timestamp'] - play_start_ts >= target:
+        if trajectory_point_sim_axis_s(pt, play_start_ts) >= target:
             return i
     return len(trajectory) - 1
+
+
+def crop_trajectory_by_csv_sim_window(trajectory, start_sim_s, end_sim_s):
+    """
+    截取仿真轴时间上闭区间内样本。
+    优先每行 CSV 列 sim_time_s；无列则 sim = timestamp − 首帧 timestamp。
+    start_sim_s、end_sim_s 均≤0 时不截取；end_sim_s≤0 表示无上限。
+    """
+    if not trajectory:
+        return trajectory
+    lo = float(start_sim_s or 0.0)
+    hi = float(end_sim_s or 0.0)
+    if lo <= 0.0 and hi <= 0.0:
+        return trajectory
+    anchor_ts = trajectory[0]['timestamp']
+    out = []
+    for p in trajectory:
+        sim = trajectory_point_sim_axis_s(p, anchor_ts)
+        if lo > 0.0 and sim < lo:
+            continue
+        if hi > 0.0 and sim > hi:
+            break
+        out.append(p)
+    return out
 
 
 def draw_center_countdown_lines(display, font_large, lines, width, height):
@@ -623,7 +731,10 @@ def build_replay_argparser(include_csv_positional=True):
         '--replay-session-log',
         default=None,
         metavar='PATH',
-        help='记录回放开始/结束时间的 JSON；默认与 CSV 同目录 <stem>_replay_session.json',
+        help=(
+            '记录回放开始/结束时间的 JSON；默认与 CSV 同目录 '
+            '<stem>_replay_session_<上级文件夹>_<被试文件夹>_<时间戳>.json'
+        ),
     )
     p.add_argument(
         '--pre-start-countdown-s',
@@ -635,7 +746,20 @@ def build_replay_argparser(include_csv_positional=True):
         '--playback-start-sim-offset-s',
         default=60.0,
         type=float,
-        help='从 CSV 首帧时间戳起算的 sim 时间（秒）达到该值后才开始播，默认 60（1 分钟）',
+        help=(
+            '截取/起点匹配的仿真轴下界（秒），闭区间；优先 CSV 列 sim_time_s'
+            '，无则用 timestamp−首帧。默认 60。'
+            '与 --playback-end-sim-s 均为 0 时不截取整条 CSV'
+        ),
+    )
+    p.add_argument(
+        '--playback-end-sim-s',
+        default=120.0,
+        type=float,
+        help=(
+            '截取仿真轴上界（秒），闭区间；优先列 sim_time_s，无则 timestamp−首帧。'
+            '默认 120；≤0 表示截取到末尾（无上限）；墙钟节拍优先 sim_time_s 相对片段首采样'
+        ),
     )
     return p
 
@@ -667,6 +791,12 @@ def validate_replay_args(args, argparser):
         argparser.error('--pre-start-countdown-s 不能为负')
     if getattr(args, 'playback_start_sim_offset_s', 0.0) < 0:
         argparser.error('--playback-start-sim-offset-s 不能为负')
+    pe = float(getattr(args, 'playback_end_sim_s', 0.0) or 0.0)
+    ps = float(getattr(args, 'playback_start_sim_offset_s', 0.0) or 0.0)
+    if pe > 0.0 and pe <= ps:
+        argparser.error(
+            '--playback-end-sim-s 必须大于 --playback-start-sim-offset-s（二者均为正时）'
+        )
 
 
 def validate_z_smooth_args(args, argparser, use_z_smooth):
@@ -736,6 +866,46 @@ def spawn_replay_vehicles_and_camera(world, args, road_z, trajectory, has_lead):
     return ego_vehicle, lead_vehicle, camera
 
 
+def sync_turn_signal_loop_audio(mp3_path, sim_windows, sim_time, state):
+    """
+    在 sim 时间落入任一 [lo, hi] 窗口内时循环播放转向灯音频；离开则停止。
+    sim_windows: [(lo, hi), ...]，与 sim_time 同刻度：
+    CSV 若含 sim_time_s 则为相位表同一绝对仿真秒；否则为相对首采样 timestamp（秒）。
+    state: 可变 dict，至少含键 'playing': bool；由本函数维护。
+    """
+    if not mp3_path or not sim_windows or not os.path.isfile(mp3_path):
+        if state.get('playing'):
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+            state['playing'] = False
+        return
+    if not pygame.mixer.get_init():
+        try:
+            pygame.mixer.init()
+        except pygame.error:
+            return
+    in_zone = False
+    for lo, hi in sim_windows:
+        if lo <= hi and lo <= sim_time <= hi:
+            in_zone = True
+            break
+    if in_zone and not state.get('playing'):
+        try:
+            pygame.mixer.music.load(mp3_path)
+            pygame.mixer.music.play(-1)
+            state['playing'] = True
+        except Exception:
+            state['playing'] = False
+    elif not in_zone and state.get('playing'):
+        try:
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+        state['playing'] = False
+
+
 def play_trajectory_once(
     *,
     args,
@@ -761,16 +931,28 @@ def play_trajectory_once(
     hold_extra_lines=None,
     session_mode_tag='L4',
     playback_start_sim_offset_s=0.0,
+    slim_experiment_session_log=False,
+    turn_signal_mp3_path=None,
+    turn_signal_sim_windows=None,
 ):
     """
     播放单条 trajectory 一次（不含外层 loop 与结束后等待）。
     返回 running：若用户 ESC/关闭窗口则为 False。
+
+    slim_experiment_session_log=True 时，写入 session_log['cycles'] 的每条仅含
+    experiment_start_system_local / experiment_end_system_local / experiment_duration_wall_s，
+    且不更新根级 experiment_* / session_end_*（供超车顺序回放等精简日志）。
+    slim=False 时，除每条 cycle 外还在根级写入 experiment_end_*（与当前回放轮次一致）。
+    experiment_* 墙钟起点在 --pre-start-countdown-s（hold_first_frame_s）结束之后；倒计时内 ESC 退出则不写入本轮 cycle。
     """
     running = True
     paused = False
     speed_mult = args.speed
     play_start_ts = trajectory[0]['timestamp']
+    traj0_pt = trajectory[0]
     last_applied_idx = [None]
+    turn_audio_state = {'playing': False}
+    sim_windows = turn_signal_sim_windows or []
 
     sun_tune = bool(args.replay_sun_overhead_forward)
     sun_alt = float(args.replay_sun_altitude_deg)
@@ -783,43 +965,59 @@ def play_trajectory_once(
         y = pt.get('ego_yaw')
         sync_replay_sun(world, sun_alt, y if y is not None else 0.0, sun_yaw_off)
 
-    exp_start_m = time.monotonic()
-    exp_wall_s = time.time()
-    now_utc = datetime.now(timezone.utc)
-    exp_start_utc = now_utc.isoformat()
-    if playback_cycle_index == 0:
-        sid = make_session_filter_id(now_utc, args.csv_file, session_mode_tag)
-        session_log['session_id'] = sid
-        print('')
-        print('========== 会话标识（检索用 / JSON 字段 session_id）==========')
-        print(f'  session_id:           {sid}')
-        print(f'  experiment_start_utc: {exp_start_utc}')
-        print('==============================================================')
-        print('')
-    cycle_rec = {
-        'playback_cycle_index': playback_cycle_index,
-        'experiment_start_utc': exp_start_utc,
-        'experiment_start_monotonic_s': exp_start_m,
-        'experiment_start_wall_time_s': exp_wall_s,
-    }
-    session_log['cycles'].append(cycle_rec)
-    session_log['playback_cycle_index'] = playback_cycle_index
-    session_log['experiment_start_utc'] = exp_start_utc
-    session_log['experiment_start_monotonic_s'] = exp_start_m
-    session_log['experiment_start_wall_time_s'] = exp_wall_s
-    _write_replay_session_log(session_log_path, session_log)
     seek_step_frames = max(1, int(len(trajectory) * (args.seek_step_pct / 100.0)))
-    seek_big_step_frames = max(1, int(len(trajectory) * (args.seek_big_step_pct / 100.0)))
+    seek_big_step_frames = max(
+        1, int(len(trajectory) * (args.seek_big_step_pct / 100.0))
+    )
+
+    exp_wall_s = None
+
+    def _finalize_playback_cycle_session():
+        end = session_clock_snapshot()
+        if slim_experiment_session_log:
+            rec = session_log['cycles'][-1]
+            rec['experiment_end_system_local'] = end['ts_system_local']
+            if exp_wall_s is not None:
+                rec['experiment_duration_wall_s'] = (
+                    end['wall_time_s'] - float(exp_wall_s)
+                )
+        else:
+            for rec in reversed(session_log['cycles']):
+                if rec.get('playback_cycle_index') != playback_cycle_index:
+                    continue
+                rec['experiment_end_system_local'] = end['ts_system_local']
+                rec['experiment_end_wall_time_s'] = end['wall_time_s']
+                rec['experiment_end_monotonic_s'] = end['monotonic_s']
+                t0 = rec.get('experiment_start_wall_time_s')
+                if t0 is not None:
+                    rec['experiment_duration_wall_s'] = end['wall_time_s'] - float(t0)
+                break
+            session_log['experiment_end_system_local'] = end['ts_system_local']
+            session_log['experiment_end_wall_time_s'] = end['wall_time_s']
+            session_log['experiment_end_monotonic_s'] = end['monotonic_s']
+            t0_root = session_log.get('experiment_start_wall_time_s')
+            if t0_root is not None:
+                session_log['experiment_duration_wall_s'] = (
+                    end['wall_time_s'] - float(t0_root)
+                )
+        try:
+            _write_replay_session_log(session_log_path, session_log)
+        except Exception:
+            pass
 
     start_idx = resolve_playback_start_frame_index(
         trajectory, play_start_ts, playback_start_sim_offset_s
     )
     if start_idx > 0:
-        sim0 = trajectory[start_idx]['timestamp'] - play_start_ts
-        print(
-            f'回放起点: sim_time≥{playback_start_sim_offset_s}s 的首帧 index={start_idx} '
-            f'(该帧 sim_time={sim0:.2f}s)'
+        sim0 = trajectory_point_sim_axis_s(
+            trajectory[start_idx], play_start_ts
         )
+        print(
+            f'回放起点: 仿真轴≥{playback_start_sim_offset_s}s 的首帧 index={start_idx} '
+            f'(该帧 sim_axis={sim0:.2f}s；墙钟节拍优先 sim_time_s 相对首采样)'
+        )
+
+    playback_end_cap_s = float(getattr(args, 'playback_end_sim_s', 0.0) or 0.0)
 
     def apply_frame(idx):
         p = trajectory[idx]
@@ -904,9 +1102,55 @@ def play_trajectory_once(
             pygame.display.flip()
             clock.tick(30)
         if not running:
+            sync_turn_signal_loop_audio(
+                turn_signal_mp3_path, sim_windows, -1.0, turn_audio_state
+            )
             return False
 
-    cur_sim0 = trajectory[start_idx]['timestamp'] - play_start_ts
+    def _begin_experiment_wall_clock_after_prestart_hold():
+        nonlocal exp_wall_s
+        now_local = datetime.now().astimezone()
+        exp_start_system_local = now_local.isoformat(timespec='microseconds')
+        exp_wall_s = time.time()
+        exp_start_m = time.monotonic()
+        if playback_cycle_index == 0:
+            sid = make_session_filter_id(now_local, args.csv_file, session_mode_tag)
+            session_log['session_id'] = sid
+            print('')
+            print('========== 会话标识（检索用 / JSON 字段 session_id）==========')
+            print(f'  session_id:           {sid}')
+            print(f'  experiment_start_system_local: {exp_start_system_local}')
+            print(' （计时起点：倒计时已结束）')
+            print('==============================================================')
+            print('')
+        if slim_experiment_session_log:
+            cycle_rec = {
+                'experiment_start_system_local': exp_start_system_local,
+                'experiment_end_system_local': None,
+                'experiment_duration_wall_s': None,
+            }
+        else:
+            cycle_rec = {
+                'playback_cycle_index': playback_cycle_index,
+                'experiment_start_system_local': exp_start_system_local,
+                'experiment_start_monotonic_s': exp_start_m,
+                'experiment_start_wall_time_s': exp_wall_s,
+                'experiment_end_system_local': None,
+                'experiment_end_monotonic_s': None,
+                'experiment_end_wall_time_s': None,
+                'experiment_duration_wall_s': None,
+            }
+        session_log['cycles'].append(cycle_rec)
+        if not slim_experiment_session_log:
+            session_log['playback_cycle_index'] = playback_cycle_index
+            session_log['experiment_start_system_local'] = exp_start_system_local
+            session_log['experiment_start_monotonic_s'] = exp_start_m
+            session_log['experiment_start_wall_time_s'] = exp_wall_s
+        _write_replay_session_log(session_log_path, session_log)
+
+    _begin_experiment_wall_clock_after_prestart_hold()
+
+    cur_sim0 = playback_elapsed_sim_s(trajectory[start_idx], play_start_ts, traj0_pt)
     wall_start = time.time() - (cur_sim0 / speed_mult)
     frame_idx = start_idx
 
@@ -922,25 +1166,25 @@ def play_trajectory_once(
                     print('暂停' if paused else '继续')
                     if not paused:
                         cur = trajectory[frame_idx]
-                        cur_sim = cur['timestamp'] - play_start_ts
+                        cur_sim = playback_elapsed_sim_s(cur, play_start_ts, traj0_pt)
                         wall_start = time.time() - (cur_sim / speed_mult)
                 elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
                     speed_mult = min(10.0, speed_mult + 0.5)
                     print(f'速度: {speed_mult}x')
                     cur = trajectory[frame_idx]
-                    cur_sim = cur['timestamp'] - play_start_ts
+                    cur_sim = playback_elapsed_sim_s(cur, play_start_ts, traj0_pt)
                     wall_start = time.time() - (cur_sim / speed_mult)
                 elif event.key == pygame.K_MINUS:
                     speed_mult = max(0.1, speed_mult - 0.5)
                     print(f'速度: {speed_mult}x')
                     cur = trajectory[frame_idx]
-                    cur_sim = cur['timestamp'] - play_start_ts
+                    cur_sim = playback_elapsed_sim_s(cur, play_start_ts, traj0_pt)
                     wall_start = time.time() - (cur_sim / speed_mult)
                 elif event.key == pygame.K_RIGHT:
                     new_idx = min(len(trajectory) - 1, frame_idx + seek_step_frames)
                     if new_idx != frame_idx:
                         frame_idx = new_idx
-                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        cur_sim = playback_elapsed_sim_s(trajectory[frame_idx], play_start_ts, traj0_pt)
                         wall_start = time.time() - (cur_sim / speed_mult)
                         print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
                         if paused:
@@ -950,7 +1194,7 @@ def play_trajectory_once(
                     new_idx = max(0, frame_idx - seek_step_frames)
                     if new_idx != frame_idx:
                         frame_idx = new_idx
-                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        cur_sim = playback_elapsed_sim_s(trajectory[frame_idx], play_start_ts, traj0_pt)
                         wall_start = time.time() - (cur_sim / speed_mult)
                         print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
                         if paused:
@@ -960,7 +1204,7 @@ def play_trajectory_once(
                     new_idx = min(len(trajectory) - 1, frame_idx + seek_big_step_frames)
                     if new_idx != frame_idx:
                         frame_idx = new_idx
-                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        cur_sim = playback_elapsed_sim_s(trajectory[frame_idx], play_start_ts, traj0_pt)
                         wall_start = time.time() - (cur_sim / speed_mult)
                         print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
                         if paused:
@@ -970,7 +1214,7 @@ def play_trajectory_once(
                     new_idx = max(0, frame_idx - seek_big_step_frames)
                     if new_idx != frame_idx:
                         frame_idx = new_idx
-                        cur_sim = trajectory[frame_idx]['timestamp'] - play_start_ts
+                        cur_sim = playback_elapsed_sim_s(trajectory[frame_idx], play_start_ts, traj0_pt)
                         wall_start = time.time() - (cur_sim / speed_mult)
                         print(f'Seek: {frame_idx + 1}/{len(trajectory)}')
                         if paused:
@@ -978,6 +1222,10 @@ def play_trajectory_once(
                             world.tick()
 
         if paused:
+            _abs = playback_absolute_sim_s(trajectory[frame_idx], play_start_ts)
+            sync_turn_signal_loop_audio(
+                turn_signal_mp3_path, sim_windows, _abs, turn_audio_state
+            )
             apply_frame(frame_idx)
             world.tick()
             camera.render(display)
@@ -994,8 +1242,16 @@ def play_trajectory_once(
             continue
 
         point = trajectory[frame_idx]
-        sim_time = point['timestamp'] - play_start_ts
-        target_time = sim_time / speed_mult
+        sim_elapsed = playback_elapsed_sim_s(point, play_start_ts, traj0_pt)
+        sync_turn_signal_loop_audio(
+            turn_signal_mp3_path,
+            sim_windows,
+            playback_absolute_sim_s(point, play_start_ts),
+            turn_audio_state,
+        )
+        if playback_end_cap_s > 0.0 and sim_elapsed > playback_end_cap_s:
+            break
+        target_time = sim_elapsed / speed_mult
         while True:
             elapsed = time.time() - wall_start
             if target_time <= elapsed:
@@ -1020,8 +1276,13 @@ def play_trajectory_once(
         )
         pygame.display.flip()
         clock.tick(60)
+        if playback_end_cap_s > 0.0 and sim_elapsed >= playback_end_cap_s:
+            frame_idx += 1
+            break
         frame_idx += 1
 
+    sync_turn_signal_loop_audio(turn_signal_mp3_path, sim_windows, -1.0, turn_audio_state)
+    _finalize_playback_cycle_session()
     return running
 
 
@@ -1041,6 +1302,24 @@ def main():
     
     # 估算缺失的朝向
     trajectory = estimate_yaw(trajectory)
+
+    lo_win = float(getattr(args, 'playback_start_sim_offset_s', 0.0) or 0.0)
+    hi_win = float(getattr(args, 'playback_end_sim_s', 0.0) or 0.0)
+    csv_anchor_before_crop = trajectory[0]['timestamp']
+    n_before_crop = len(trajectory)
+    did_crop_segment = lo_win > 0.0 or hi_win > 0.0
+    if did_crop_segment:
+        trajectory = crop_trajectory_by_csv_sim_window(trajectory, lo_win, hi_win)
+        hi_txt = f'{hi_win:g}' if hi_win > 0.0 else '+∞'
+        print(
+            f'已截取仿真轴 ∈ [{lo_win:g}, {hi_txt}] s（优先列 sim_time_s，否则 timestamp−首行）：'
+            f'{n_before_crop} → {len(trajectory)} 点'
+        )
+        if not trajectory:
+            print('错误: 截取后轨迹为空')
+            return
+        args.playback_start_sim_offset_s = 0.0
+        args.playback_end_sim_s = 0.0
     
     # 检查是否有前车数据
     has_lead = trajectory[0].get('lead_x') is not None and not args.no_lead
@@ -1054,15 +1333,22 @@ def main():
         'session_id': None,
         'replay_session_log': session_log_path,
         'csv_file': os.path.abspath(args.csv_file),
+        'csv_sim_anchor_original': csv_anchor_before_crop,
+        'replay_sim_window_csv_lo_s': lo_win if lo_win > 0.0 else None,
+        'replay_sim_window_csv_hi_s': hi_win if hi_win > 0.0 else None,
         'trajectory_first_timestamp': trajectory[0]['timestamp'],
         'speed_at_launch': float(args.speed),
         'loop': bool(args.loop),
         'playback_cycle_index': None,
-        'experiment_start_utc': None,
+        'experiment_start_system_local': None,
         'experiment_start_monotonic_s': None,
         'experiment_start_wall_time_s': None,
+        'experiment_end_system_local': None,
+        'experiment_end_monotonic_s': None,
+        'experiment_end_wall_time_s': None,
+        'experiment_duration_wall_s': None,
         'cycles': [],
-        'session_end_utc': None,
+        'session_end_system_local': None,
     }
 
     # 初始化Pygame
@@ -1149,10 +1435,24 @@ def main():
     print('按 ESC 退出, 空格键 暂停/继续, +/- 调整速度')
     print('按 ←/→ 调整进度(默认1%%)，按 PgUp/PgDn 快速跳转(默认10%%)')
     print(f'会话记录(JSON): {session_log_path}')
-    print(
-        f'正式回放前: {args.pre_start_countdown_s}s 中央倒计时（0=关闭）；'
-        f'从 sim_time≥{args.playback_start_sim_offset_s}s 的首帧起播'
-    )
+    if did_crop_segment:
+        hi_desc = f'{hi_win:g}' if hi_win > 0.0 else '+∞'
+        print(
+            '已按仿真轴（优先 sim_time_s）截取片段；墙钟节拍以 sim_time_s 相对片段首行为准'
+            '（≈原 CSV 轴 '
+            f'[{lo_win:g}, {hi_desc}] s）；'
+            f'正式回放前: {args.pre_start_countdown_s}s 中央倒计时（0=关闭）'
+        )
+    else:
+        end_h = (
+            f'；sim_time≥{args.playback_end_sim_s:g}s 时结束（本帧播完）'
+            if float(getattr(args, 'playback_end_sim_s', 0.0) or 0.0) > 0.0
+            else ''
+        )
+        print(
+            f'正式回放前: {args.pre_start_countdown_s}s 中央倒计时（0=关闭）；'
+            f'从 sim_time≥{args.playback_start_sim_offset_s}s 的首帧起播{end_h}'
+        )
 
     sun_tune = bool(args.replay_sun_overhead_forward)
     sun_alt = float(args.replay_sun_altitude_deg)
@@ -1212,7 +1512,29 @@ def main():
         print('\n用户中断')
 
     finally:
-        session_log['session_end_utc'] = datetime.now(timezone.utc).isoformat()
+        _end = session_clock_snapshot()
+        session_log['session_end_system_local'] = _end['ts_system_local']
+        if session_log.get('experiment_end_system_local') is None:
+            session_log['experiment_end_system_local'] = _end['ts_system_local']
+            session_log['experiment_end_wall_time_s'] = _end['wall_time_s']
+            session_log['experiment_end_monotonic_s'] = _end['monotonic_s']
+            t0 = session_log.get('experiment_start_wall_time_s')
+            if t0 is not None:
+                session_log['experiment_duration_wall_s'] = (
+                    _end['wall_time_s'] - float(t0)
+                )
+            for rec in reversed(session_log.get('cycles') or []):
+                if rec.get('experiment_end_system_local') is not None:
+                    continue
+                rec['experiment_end_system_local'] = _end['ts_system_local']
+                rec['experiment_end_wall_time_s'] = _end['wall_time_s']
+                rec['experiment_end_monotonic_s'] = _end['monotonic_s']
+                t0c = rec.get('experiment_start_wall_time_s')
+                if t0c is not None:
+                    rec['experiment_duration_wall_s'] = (
+                        _end['wall_time_s'] - float(t0c)
+                    )
+                break
         try:
             _write_replay_session_log(session_log_path, session_log)
         except Exception:

@@ -164,7 +164,7 @@ Write-Host "Overtake root: $OvertakeRoot" -ForegroundColor DarkGray
 Write-Host "Pygame display indices - main:$dMain left:$dLeft right:$dRight back:$dBack leftBack:$dLb rightBack:$dRb (screens detected: $screenCount)" -ForegroundColor DarkGray
 
 $hold = [string]$HoldFirstFrameSec -replace ',', '.'
-$replayCmd = "python `"$replayPy`" `"$OvertakeRoot`" --host $CarlaHost --port $CarlaPort --res 1920x1080 --display $dMain --snap-to-road --z-smooth-alpha 0.2 --z-smooth-max-step 0.06 --hold-first-frame-s $hold --pre-start-countdown-s 0 --playback-start-sim-offset-s 0"
+$replayCmd = "python `"$replayPy`" `"$OvertakeRoot`" --host $CarlaHost --port $CarlaPort --res 1920x1080 --display $dMain --snap-to-road --z-smooth-alpha 0.2 --z-smooth-max-step 0.06 --hold-first-frame-s $hold --pre-start-countdown-s 0 --playback-start-sim-offset-s 3"
 
 $cameraJobs = @(
     @{
